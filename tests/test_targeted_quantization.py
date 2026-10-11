@@ -325,6 +325,94 @@ class KQuantizationPlanTests(unittest.TestCase):
             del reader
         self.assertEqual(file_type, gguf.LlamaFileType.MOSTLY_Q4_K_M.value)
 
+    def test_conversion_restores_convrot_weights_from_checkpoint_metadata(self):
+        source = torch.tensor(
+            [[2.0, 2.0, 2.0, 2.0], [2.0, -2.0, 2.0, -2.0]],
+            dtype=torch.float32,
+        )
+        qdata, scale, quant_conf, _ = quantize_int8_convrot(
+            source, convrot_groupsize=4, device=torch.device("cpu")
+        )
+        state_dict = {
+            "blocks.0.attn.wq.weight": qdata,
+            "blocks.0.attn.wq.weight_scale": scale,
+            "txtfusion.projector.weight": torch.ones((2, 2), dtype=torch.float16),
+            "first.weight": torch.ones((2, 2), dtype=torch.float16),
+        }
+        metadata = {
+            "_quantization_metadata": json.dumps({
+                "format": "int8_convrot",
+                "layers": {"blocks.0.attn.wq": quant_conf},
+            })
+        }
+        with TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "krea2-convrot.safetensors"
+            output_path = Path(temp_dir) / "krea2-convrot.gguf"
+            save_file(state_dict, str(source_path), metadata=metadata)
+            for streamed in (False, True):
+                output_path = Path(temp_dir) / f"krea2-convrot-{streamed}.gguf"
+                converted_path, _ = convert_file(
+                    str(source_path),
+                    str(output_path),
+                    interact=False,
+                    quant_type_name="F16",
+                    streamed=streamed,
+                )
+                reader = gguf.GGUFReader(converted_path)
+                tensor = next(
+                    tensor for tensor in reader.tensors
+                    if tensor.name == "blocks.0.attn.wq.weight"
+                )
+                actual = torch.from_numpy(tensor.data.copy()).view(torch.float16).reshape(
+                    tuple(reversed(tensor.shape))
+                )
+                reader.tensors.clear()
+                reader.fields.clear()
+                reader.data._mmap.close()
+                del reader
+                with self.subTest(streamed=streamed):
+                    self.assertTrue(torch.equal(actual, source.to(torch.float16)))
+
+    def test_streamed_conversion_restores_scaled_int8_source_weights(self):
+        state_dict = {
+            "blocks.0.attn.wq.weight": torch.tensor(
+                [[10, -20], [30, -40]], dtype=torch.int8
+            ),
+            "blocks.0.attn.wq.weight_scale": torch.tensor([0.1, 0.01]),
+            "txtfusion.projector.weight": torch.ones((2, 2), dtype=torch.float16),
+            "first.weight": torch.ones((2, 2), dtype=torch.float16),
+        }
+        with TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "krea2-int8.safetensors"
+            output_path = Path(temp_dir) / "krea2-f16.gguf"
+            save_file(state_dict, str(source_path))
+            converted_path, _ = convert_file(
+                str(source_path),
+                str(output_path),
+                interact=False,
+                quant_type_name="F16",
+                streamed=True,
+            )
+            reader = gguf.GGUFReader(converted_path)
+            tensor = next(
+                tensor for tensor in reader.tensors
+                if tensor.name == "blocks.0.attn.wq.weight"
+            )
+            actual = torch.from_numpy(tensor.data.copy()).view(torch.float16).reshape(
+                tuple(reversed(tensor.shape))
+            )
+            reader.tensors.clear()
+            reader.fields.clear()
+            reader.data._mmap.close()
+            del reader
+
+        self.assertTrue(
+            torch.equal(
+                actual,
+                torch.tensor([[1.0, -2.0], [0.3, -0.4]], dtype=torch.float16),
+            )
+        )
+
     def test_uniform_k_conversions_work_without_gguf_k_encoder(self):
         expected = {
             "Q4_K": gguf.GGMLQuantizationType.Q4_K,
@@ -1255,15 +1343,21 @@ class GGUFLoraTests(unittest.TestCase):
         state_dict = {
             "blocks.0.proj.weight": qdata,
             "blocks.0.proj.weight_scale": scale,
-            "blocks.0.proj.comfy_quant": torch.tensor(
-                list(json.dumps(quant_conf).encode("utf-8")), dtype=torch.uint8
-            ),
         }
 
-        materialize_int8_source_weights(state_dict)
+        materialize_int8_source_weights(
+            state_dict,
+            {
+                "_quantization_metadata": json.dumps({
+                    "format": "int8_convrot",
+                    "layers": {
+                        "model.diffusion_model.blocks.0.proj": quant_conf,
+                    },
+                })
+            },
+        )
 
         self.assertNotIn("blocks.0.proj.weight_scale", state_dict)
-        self.assertNotIn("blocks.0.proj.comfy_quant", state_dict)
         self.assertTrue(
             torch.equal(
                 state_dict["blocks.0.proj.weight"],
