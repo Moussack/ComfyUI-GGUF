@@ -1,5 +1,5 @@
 # (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
-"""Optional native Linear backend for GGML K-quant weights.
+"""Optional accelerated Linear backend for GGML K-quant weights.
 
 An accelerator package may either call :func:`register_kquant_backend` during
 import or expose ``linear`` (and optionally ``supports``) from the module named
@@ -24,7 +24,6 @@ SUPPORTED_K_QUANTS = frozenset(
     }
 )
 _BACKEND_ENV = "COMFYUI_GGUF_KQUANT_BACKEND"
-_DEFAULT_BACKEND_MODULE = "comfyui_gguf_kquant"
 _LOCAL_BACKEND_MODULE = ".kquant_triton_backend"
 _backend = None
 _backend_checked = False
@@ -64,9 +63,20 @@ def _load_backend():
             return _backend
 
         configured_module = os.environ.get(_BACKEND_ENV, "").strip()
-        candidates = [configured_module] if configured_module else [_DEFAULT_BACKEND_MODULE]
-        if not configured_module:
-            candidates.append(_LOCAL_BACKEND_MODULE)
+        if configured_module.lower() in {"", "none", "off", "disabled", "false"}:
+            _backend_checked = True
+            logging.info(
+                "ComfyUI-GGUF: optional K-quant backend is disabled; "
+                "set %s=bundled to enable the experimental Triton backend",
+                _BACKEND_ENV,
+            )
+            return None
+
+        candidates = (
+            [_LOCAL_BACKEND_MODULE]
+            if configured_module.lower() == "bundled"
+            else [configured_module]
+        )
         last_error = None
         for module_name in candidates:
             try:
@@ -141,8 +151,30 @@ def _backend_supports(backend, *, qtype, input_tensor, qdata, weight_shape):
     )
 
 
-def try_kquant_linear(input_tensor, qdata, qtype, weight_shape, bias=None):
-    """Return native Linear output, or ``None`` when fallback should be used."""
+def _backend_should_use(backend, *, qtype, input_tensor, qdata, weight_shape, dequant_dtype):
+    should_use = getattr(backend, "should_use", None)
+    precision_kwargs = (
+        {"dequant_dtype": dequant_dtype}
+        if getattr(backend, "supports_dequant_dtype", False)
+        else {}
+    )
+    if not callable(should_use):
+        return True
+    return bool(
+        should_use(
+            qtype=qtype.name,
+            device=input_tensor.device,
+            input_dtype=input_tensor.dtype,
+            input_shape=tuple(input_tensor.shape),
+            weight_shape=weight_shape,
+            weight_dtype=qdata.dtype,
+            **precision_kwargs,
+        )
+    )
+
+
+def try_kquant_linear(input_tensor, qdata, qtype, weight_shape, bias=None, *, dequant_dtype="target"):
+    """Return accelerated Linear output, or ``None`` when fallback should be used."""
     if qtype not in SUPPORTED_K_QUANTS or not torch.is_tensor(qdata):
         return None
 
@@ -164,6 +196,11 @@ def try_kquant_linear(input_tensor, qdata, qtype, weight_shape, bias=None):
     backend = _load_backend()
     if backend is None:
         return None
+    decode_dtype = input_tensor.dtype if dequant_dtype == "target" else dequant_dtype
+    decode_dtype = torch.float16 if decode_dtype is None else decode_dtype
+    precision_aware = getattr(backend, "supports_dequant_dtype", False)
+    if not precision_aware and decode_dtype != input_tensor.dtype:
+        return None
 
     route = _route_key(backend, qtype, input_tensor)
     if route in _failed_routes:
@@ -176,14 +213,23 @@ def try_kquant_linear(input_tensor, qdata, qtype, weight_shape, bias=None):
             input_tensor=input_tensor,
             qdata=qdata,
             weight_shape=weight_shape,
+        ) or not _backend_should_use(
+            backend,
+            qtype=qtype,
+            input_tensor=input_tensor,
+            qdata=qdata,
+            weight_shape=weight_shape,
+            dequant_dtype=decode_dtype,
         ):
             return None
+        precision_kwargs = {"dequant_dtype": decode_dtype} if precision_aware else {}
         output = backend.linear(
             input=input_tensor,
             weight=qdata.contiguous(),
             qtype=qtype.name,
             weight_shape=weight_shape,
             bias=bias,
+            **precision_kwargs,
         )
         expected_shape = (*input_tensor.shape[:-1], weight_shape[0])
         if not torch.is_tensor(output) or tuple(output.shape) != expected_shape:

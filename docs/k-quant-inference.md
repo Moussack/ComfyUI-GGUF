@@ -3,12 +3,132 @@
 ## Conclusion
 
 `_K` quants reduce GGUF storage and can reduce the resident compressed-weight
-footprint. Standard GGML weights use the portable dequantization path when no
-native backend is available. Q4_K, Q5_K, and Q6_K Linear weights can instead
-use the bundled optional Triton backend on CUDA; it receives the original GGUF
-blocks directly and fuses unpacking with the matrix multiply. Unsupported
-routes automatically fall back to the reference path, and no universal speed
-up should be assumed without a benchmark on the target GPU.
+footprint. Standard GGML weights use the portable dequantization path by
+default. Q4_K, Q5_K, and Q6_K Linear weights can instead use the experimental
+bundled Triton backend on CUDA, but only when explicitly enabled with
+`COMFYUI_GGUF_KQUANT_BACKEND=bundled`. It receives the original GGUF blocks
+directly and accelerates unpacking/dequantization, followed by the same
+PyTorch `Linear` as the portable path; it is not low-bit arithmetic and still
+materializes a floating-point weight. Unsupported routes fall back to the
+reference path. Leave the backend disabled unless its output and performance
+have been validated on the target GPU and workflow; no universal speedup
+should be assumed.
+
+A [report on issue #26](https://github.com/molbal/ComfyUI-GGUF/issues/26#issuecomment-6047409099)
+found the bundled Triton backend about 5x slower for LTX 2.3 Q5_K_M i2v and
+about 2.2x slower for t2v on Windows with an RTX 5090 (SM 12.0) and
+`triton-windows 3.6.0.post26`; outputs also differed from the portable path.
+Keep it disabled on that setup until a compatible backend is validated.
+
+Earlier investigation on an RTX 3080 Laptop (SM 8.6, PyTorch 2.14.0+cu130,
+Triton 3.1.0) found that the fused kernel's default staging could produce
+intermittently incorrect Q6_K outputs on one-hot probes of a real Qwen3 weight.
+Setting `num_stages=1` removed the observed variation and matched the portable
+dequantized weights exactly in those probes. Rounding decoded intermediates
+to the activation dtype matched an explicit `target` decode reference, but
+did not preserve the loader's default FP16 decoding with BF16 activations.
+Even with identical decoded weights, the fused matrix multiply and bias
+handling differed from PyTorch's `Linear`. Compute
+Sanitizer racecheck reported no hazards for the one-stage Q4_K/Q5_K/Q6_K test
+cases.
+
+Larger fused matmul tiles reduced the original slowdown, but did not solve
+output equivalence. One reduced i2v run (256x256 latent, 9 frames, one denoise
+step per stage) took 152.88 s with the tuned fused route versus 153.87 s with
+the backend off; mean frame PSNR was 39.9 dB, not identical output.
+
+The next round replaced the fused matmul with a single Triton decoding pass
+and reference PyTorch `Linear`. This preserves PyTorch's accumulation, bias,
+and reduced-precision settings rather than trying to reproduce cuBLAS in a
+custom matmul. Decoder intermediates round to the requested decode dtype,
+including FP16 for the default and Dynamic VRAM paths, before casting to the
+activation dtype. FP32 fusion is disabled to preserve the reference's
+separate multiplication and subtraction.
+
+An alternating warm sweep used real LTX weights, CUDA events, five warmups,
+and 21 measurements per implementation per case. It covered three layers,
+FP16/BF16 activations, default/activation decode precision, and seven row
+counts from 1 to 1024: 84 cases. Every candidate output was bit-identical to
+the corresponding portable `Linear`; every candidate case was faster than
+portable, with the smallest measured speedup 1.52x. Representative BF16
+activation/BF16 decode results are below. These are layer timings, not
+full-workflow latency:
+
+| GGUF layer shape `(N, K)` | Rows `M` | Portable (ms) | Previous tuned fused (ms) | Triton decode + PyTorch Linear (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| Q5_K `(4096, 4096)` attention | 128 | 2.71 | 1.11 | 0.50 |
+| Q5_K `(4096, 4096)` attention | 256 | 2.38 | 1.16 | 0.59 |
+| Q5_K `(16384, 4096)` FFN up | 128 | 6.95 | 4.00 | 1.63 |
+| Q5_K `(16384, 4096)` FFN up | 256 | 7.23 | 4.43 | 2.12 |
+| Q6_K `(4096, 16384)` FFN down | 128 | 7.33 | 2.76 | 1.95 |
+| Q6_K `(4096, 16384)` FFN down | 512 | 11.30 | 7.89 | 4.83 |
+
+Current dispatch permits only these three matrix shapes, FP16/BF16
+activations, CUDA SM 8.6, and 1 through 1024 activation rows. Q4_K is covered
+by decoder tests but not routed in production. Other GPU capabilities,
+including the reporter's SM 12.0 RTX 5090, use portable fallback even when
+`bundled` is selected. This is a local tuning result, not proof of a universal
+or city96-relative end-to-end speedup.
+
+Six reduced i2v executions of the reporter's KJ-loader graph used the same
+seed, example input, 256x256 initial latent, 9 output frames at 512x512, and
+one denoise step per stage. One portable and one candidate warmup preceded
+two alternating measured runs of each. Both sampled video latents and every
+decoded image element were bit-identical across all six executions, including
+the portable-versus-portable control; all captured tensors were finite.
+The candidate served 832 backend calls per execution without a failure
+fallback. Audio decoding and video encoding were omitted so compression
+could not hide or create output differences.
+
+| Warm reduced-workflow timing | Portable | Candidate |
+| --- | ---: | ---: |
+| ComfyUI prompt execution median | 103.29 s | 98.30 s |
+| Instrumented sampling/upscale/video-decode pipeline median | 48.93 s | 42.34 s |
+
+This is a measured 4.8% prompt-latency reduction in this reduced, default-cache
+workflow, with only two measured runs per route. These are not verified
+cached-prompt timings: a later comparison found that ComfyUI's default
+RAM-pressure cache can evict nodes and repeat text encoding and model loading.
+It is not a full-resolution
+or RTX 5090 result and does not resolve the separate city96-relative
+text-encoder regression. The backend remains disabled by default. Nineteen
+focused backend tests passed, including actual static and Dynamic VRAM
+operations, and CUDA memcheck found no errors in the new decoder tests.
+An isolated decoder racecheck also reported zero hazards while Q4_K, Q5_K,
+and Q6_K results matched CPU references across FP16/BF16/FP32 decode precision
+and FP16/BF16 output precision.
+
+A direct comparison then used city96 `6ea2651` (the reporter's revision and
+upstream HEAD at measurement time), fork `e5e7ce3` with the backend disabled,
+and the same fork with `bundled` enabled. The models, local ComfyUI
+installation, KJ loader settings, reduced graph, seed, and input were
+unchanged. An initial default-cache sweep confirmed bit-identical outputs,
+but unequal cached-node sets made its timing comparison unsuitable for
+isolating the execution paths.
+
+The controlled repeat used `--cache-classic` for all three implementations
+and verified the same 23 cached nodes in every measured execution, including
+text encoding and model loading. Six isolated processes ran in the order
+city96 / fork-portable / candidate / candidate / fork-portable / city96,
+with one warmup and two measured runs per process: four measured runs per
+implementation. Cold loads and warmups are excluded from the following table.
+Audio decoding and video encoding remain excluded.
+
+| Cached reduced-workflow timing | city96 `6ea2651` | Fork portable `e5e7ce3` | Candidate `e5e7ce3` |
+| --- | ---: | ---: | ---: |
+| ComfyUI prompt median | 46.47 s | 43.29 s | 41.48 s |
+| Prompt range across four measured runs | 46.20-46.82 s | 42.02-45.28 s | 38.95-43.01 s |
+| Sampling/upscale/video-decode pipeline median | 46.31 s | 43.13 s | 41.30 s |
+
+The candidate's prompt median was 10.7% lower than city96 and 4.2% lower
+than this fork's portable path in this cache-controlled reduced workflow.
+Both sampled video latents and every decoded frame element were bit-identical
+to city96 across all 18 executions, including warmups and repeat controls.
+All tensors were finite. Candidate runs served 832 backend calls each,
+without a failure fallback. The portable/candidate timing ranges overlap,
+so this remains a small-sample local result rather than a universal speed
+claim. It does not establish RTX 5090 performance, full-resolution LTX
+performance, or text-encoder performance; text encoding was cached.
 
 `_K` remains reasonable for text encoders when the compressed file or
 CPU/offload footprint is the primary constraint and the one-time text encoding
@@ -75,22 +195,28 @@ mmap-backed until needed, but the operation still needs a full floating-point
 temporary.
 
 For eligible 2-D Q4_K, Q5_K, and Q6_K Linear weights, both the standard
-`GGMLOps.Linear` path and Dynamic VRAM's `GGMLLayout` first offer the compressed
-GGUF bytes to the optional backend. Weight patches/LoRAs continue to use the
-portable path so ComfyUI's patch semantics remain unchanged. Unsupported
-devices, dtypes, shapes, operations, missing backends, and rejected kernel
-calls also fall back to the existing dequantized operation.
+`GGMLOps.Linear` path and Dynamic VRAM's `GGMLLayout` can offer compressed
+GGUF bytes to the backend when it is enabled. Weight patches/LoRAs continue to
+use the portable path so ComfyUI's patch semantics remain unchanged.
+Unsupported devices, dtypes, shapes, operations, unavailable backends, and
+rejected kernel calls also fall back to the existing dequantized operation.
 
 ### Optional backend contract
 
-Set `COMFYUI_GGUF_KQUANT_BACKEND` to an importable Python module name to
-override the bundled backend. If it is unset, the integration first probes
-`comfyui_gguf_kquant` and then the bundled Triton backend. Triton and CUDA are
-optional; when they are unavailable the reference path remains active. A
-backend module may expose itself (or `backend`) with:
+The backend is disabled by default. Set
+`COMFYUI_GGUF_KQUANT_BACKEND=bundled` to opt in to the experimental bundled
+Triton backend. Leave the variable unset or set it to `none`, `off`,
+`disabled`, or `false` to use portable dequantization. To use a custom backend,
+set the variable to its importable Python module name instead. Triton and CUDA
+are optional; when unavailable, the bundled backend rejects the route and the
+reference path remains active. A backend module may expose itself (or
+`backend`) with:
 
 ```python
 def supports(*, qtype, device, input_dtype, weight_shape, weight_dtype) -> bool:
+    ...
+
+def should_use(*, qtype, device, input_dtype, input_shape, weight_shape, weight_dtype) -> bool:
     ...
 
 def linear(*, input, weight, qtype, weight_shape, bias):
@@ -104,11 +230,25 @@ matrix. `linear` must return the same shape and device as
 dtype. Alternatively, the module can call `register_kquant_backend()` from
 [`kquant_backend.py`](../kquant_backend.py) while it imports.
 
-The integration verifies the block-storage size and output contract. A backend
-that rejects or fails a route is disabled for that quant/device/dtype
-combination, and subsequent calls use the portable fallback. Backend packages
-remain responsible for compiled-kernel correctness, device capability checks,
-stream safety, and numerical validation against GGML dequantization.
+Precision-aware backends set `supports_dequant_dtype = True`; the dispatcher
+then also passes `dequant_dtype` to `linear()` and optional `should_use()`.
+It is a resolved `torch.dtype`, separate from the input/output dtype:
+`None` from a loader resolves to FP16 and `target` resolves to the activation
+dtype. Decode intermediates must use this precision before casting the
+completed weight. Backends without this capability keep their original
+signature, but are declined when decode and activation precision differ.
+Dynamic VRAM additionally declines acceleration when the stored logical
+weight dtype differs from the activation dtype, preserving the portable
+operation's dtype checks.
+
+The integration verifies the block-storage size and output contract. A
+backend's optional `should_use()` can decline particular shapes without
+blacklisting the route; this supports performance-based fallback. A backend
+that fails initialization or a kernel call is disabled for that
+quant/device/dtype combination, and subsequent calls use the portable fallback.
+Backend packages remain responsible for compiled-kernel correctness, device
+capability checks, stream safety, and numerical validation against GGML
+dequantization.
 
 In contrast, `Q8_CR` is converted to ComfyUI's
 `TensorWiseINT8Layout`; [`get_gguf_q8_ops()`](../ops.py) retains INT8 weights
@@ -125,7 +265,7 @@ dequantize-then-FP16/BF16-matmul sequence for eligible Linear layers.
 | Diffusion denoising latency | Usually unfavorable: every sampling step revisits many layers and repeats unpacking. |
 | Text-encoder latency | May be acceptable because encoding occurs once per prompt, but measure it. |
 | Output quality at a size budget | Often better than legacy quants of comparable payload size, but architecture- and model-dependent. |
-| Native low-bit throughput | Available for eligible Linear layers through the bundled Triton/CUDA backend; other routes use the portable fallback. |
+| Accelerated K-quant Linear | Experimental and opt-in; Triton decoding still materializes a floating weight and uses reference PyTorch Linear. Other routes use the portable fallback. |
 
 The actual outcome also depends on GPU, CPU, PCIe bandwidth, batch/sequence
 size, ComfyUI offload policy, and whether the model is compute- or
