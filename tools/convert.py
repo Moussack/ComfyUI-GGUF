@@ -1902,13 +1902,13 @@ def convert_file(
             lora_strengths=lora_strengths,
         )
     state_dict = load_state_dict(path, progress_callback=progress_callback)
-    restored_int8_count = materialize_int8_source_weights(state_dict)
+    source_metadata = load_safetensors_metadata(path)
+    restored_int8_count = materialize_int8_source_weights(state_dict, source_metadata)
     if restored_int8_count:
         logging.info(
             "Restored %d scaled INT8 source weight(s) to FP16 before conversion.",
             restored_int8_count,
         )
-    source_metadata = load_safetensors_metadata(path)
     lora_paths = lora_paths or []
     lora_strengths = lora_strengths or []
     if lora_strengths and len(lora_strengths) != len(lora_paths):
@@ -2080,8 +2080,30 @@ def convert_safetensors_streamed(
     try:
         with safe_open(path, framework="pt", device="cpu") as checkpoint:
             total = len(state_dict)
-            for index, (key, _) in enumerate(state_dict.items(), start=1):
-                data = checkpoint.get_tensor(source_keys[key])
+            consumed_int8_metadata = set()
+            for index, (key, layout_tensor) in enumerate(state_dict.items(), start=1):
+                source_key = source_keys[key]
+                if source_key in consumed_int8_metadata:
+                    continue
+                data = checkpoint.get_tensor(source_key)
+                if data.dtype == torch.int8:
+                    scale_key = f"{key}_scale"
+                    conf_key = f"{key[:-len('weight')]}comfy_quant" if key.endswith("weight") else None
+                    metadata = {key: data}
+                    if scale_key in source_keys:
+                        source_scale_key = source_keys[scale_key]
+                        metadata[scale_key] = checkpoint.get_tensor(source_scale_key)
+                        consumed_int8_metadata.add(source_scale_key)
+                    if conf_key in source_keys:
+                        source_conf_key = source_keys[conf_key]
+                        metadata[conf_key] = checkpoint.get_tensor(source_conf_key)
+                        consumed_int8_metadata.add(source_conf_key)
+                    materialize_int8_source_weights(metadata, source_metadata)
+                    data = metadata[key]
+                elif key.endswith("_scale") and key[:-len("_scale")] in state_dict:
+                    paired_key = key[:-len("_scale")]
+                    if layout_tensor.dtype == torch.float32 and state_dict[paired_key].dtype == torch.int8:
+                        continue
                 if key in resolved_loras:
                     source_scale = None
                     scale_key = f"{key}_scale"
