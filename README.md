@@ -158,14 +158,20 @@ this converter and requires every selected row to be divisible by 256.
 Architecture-protected, convolution, small, and one-dimensional tensors retain
 higher precision. The local encoder is used even when the installed `gguf`
 Python package only supports reading K quants; output is still validated against
-the repository’s reference dequantizer. K-quant inference uses the portable
-dequantization path by default. The experimental bundled Triton/CUDA Linear
-backend is opt-in with `COMFYUI_GGUF_KQUANT_BACKEND=bundled`; validate both
-output and performance on your hardware before enabling it. Its current
-implementation accelerates decoding, then uses the same PyTorch Linear as the
-portable path, including the loader's decode precision and bias behavior.
-It still materializes a floating-point weight. Its configs are limited to SM
-8.6, a few benchmarked LTX Q5_K/Q6_K matrix shapes, and at most 1024 activation
-rows; every other route stays on portable PyTorch. This
-is a local RTX 3080 Laptop tuning result, not an RTX 5090 or end-to-end speed
-claim. See [K-quant inference notes](docs/k-quant-inference.md) for details.
+the repository’s reference dequantizer.
+
+For eligible K-quant Linear operations, the experimental bundled Triton/CUDA
+backend is enabled by default; unsupported routes continue to use portable
+PyTorch dequantization. It accelerates decoding but still materializes a
+floating-point weight and uses the same PyTorch Linear as the portable path.
+Q3_K is supported on CUDA SM 8.6 with FP16/BF16 activations and up to 8192 rows;
+Q5_K/Q6_K remain limited to measured LTX matrix shapes and at most 1024 rows.
+Set `COMFYUI_GGUF_KQUANT_BACKEND=none` before starting ComfyUI to opt out.
+
+In a warmed Krea-2 Turbo Q3_K_M benchmark (1024x1024, 9-step
+`er_sde`/`simple`) on a local RTX 3080 Laptop, the bundled path measured a
+56.90 s median versus 86.43 s with the backend off across three pairs, with
+bit-identical outputs. All three bundled runs were faster, but the GPU was not
+fully idle and backend-off times varied substantially. Treat this as
+best-effort local evidence, not a general speed claim. See
+[K-quant inference notes](docs/k-quant-inference.md) for details.

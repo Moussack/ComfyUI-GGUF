@@ -1,5 +1,5 @@
 # (c) City96 || Apache-2.0 (apache.org/licenses/LICENSE-2.0)
-"""Optional accelerated Linear backend for GGML K-quant weights.
+"""Accelerated Linear backend for GGML K-quant weights.
 
 An accelerator package may either call :func:`register_kquant_backend` during
 import or expose ``linear`` (and optionally ``supports``) from the module named
@@ -18,12 +18,14 @@ import torch
 
 SUPPORTED_K_QUANTS = frozenset(
     {
+        gguf.GGMLQuantizationType.Q3_K,
         gguf.GGMLQuantizationType.Q4_K,
         gguf.GGMLQuantizationType.Q5_K,
         gguf.GGMLQuantizationType.Q6_K,
     }
 )
 _BACKEND_ENV = "COMFYUI_GGUF_KQUANT_BACKEND"
+_DEFAULT_BACKEND = "bundled"
 _LOCAL_BACKEND_MODULE = ".kquant_triton_backend"
 _backend = None
 _backend_checked = False
@@ -62,13 +64,16 @@ def _load_backend():
         if _backend_checked:
             return _backend
 
-        configured_module = os.environ.get(_BACKEND_ENV, "").strip()
-        if configured_module.lower() in {"", "none", "off", "disabled", "false"}:
+        configured_module = os.environ.get(_BACKEND_ENV, _DEFAULT_BACKEND).strip()
+        if not configured_module:
+            configured_module = _DEFAULT_BACKEND
+        if configured_module.lower() in {"none", "off", "disabled", "false"}:
             _backend_checked = True
             logging.info(
-                "ComfyUI-GGUF: optional K-quant backend is disabled; "
-                "set %s=bundled to enable the experimental Triton backend",
+                "ComfyUI-GGUF: K-quant backend opted out via %s=%r; "
+                "using portable dequantization",
                 _BACKEND_ENV,
+                configured_module,
             )
             return None
 
@@ -83,9 +88,7 @@ def _load_backend():
                 module = importlib.import_module(module_name, package=__package__)
                 if _backend is None:
                     _backend = _module_backend(module)
-                logging.info(
-                    "ComfyUI-GGUF: enabled optional K-quant backend %s", module_name
-                )
+                logging.info("ComfyUI-GGUF: enabled K-quant backend %s", module_name)
                 break
             except ModuleNotFoundError as error:
                 last_error = error

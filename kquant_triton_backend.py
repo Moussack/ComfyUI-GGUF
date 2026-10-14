@@ -10,7 +10,7 @@ except ImportError:
     tl = None
 
 
-SUPPORTED = {"Q4_K", "Q5_K", "Q6_K"}
+SUPPORTED = {"Q3_K", "Q4_K", "Q5_K", "Q6_K"}
 _BLOCK_SIZE = 256
 
 
@@ -40,9 +40,12 @@ def _select_launch_config(*, qtype, input_dtype, input_shape, weight_shape, devi
     m_size = 1
     for dim in input_shape[:-1]:
         m_size *= dim
-    if m_size <= 0 or m_size > 1024:
+    max_m_size = 8192 if qtype == "Q3_K" else 1024
+    if m_size <= 0 or m_size > max_m_size:
         return None
 
+    if qtype == "Q3_K":
+        return 256, 4
     if (
         qtype == "Q5_K" and tuple(weight_shape) in {(16384, 4096), (4096, 4096)}
         or qtype == "Q6_K" and tuple(weight_shape) == (4096, 16384)
@@ -80,7 +83,34 @@ if triton is not None:
         valid = i < size
         local = i % 256
         block = i // 256
-        if QTYPE == 2:
+        if QTYPE == 3:
+            # Q3_K block: hmask[32], qs[64], scales[12], d[fp16].
+            base = q_ptr + block * 110
+            scale_group = local // 16
+            d = tl.load(
+                (base + 108).to(tl.pointer_type(tl.float16)), mask=valid, other=0
+            ).to(DECODE_DTYPE).to(tl.float32)
+            low_scale_byte = tl.load(
+                base + 96 + scale_group % 8, mask=valid, other=0
+            )
+            high_scale_byte = tl.load(
+                base + 104 + scale_group % 4, mask=valid, other=0
+            )
+            low_scale = (low_scale_byte >> ((scale_group // 8) * 4)) & 15
+            high_scale = (high_scale_byte >> ((scale_group // 4) * 2)) & 3
+            scale = (low_scale.to(tl.int32) | (high_scale.to(tl.int32) << 4)) - 32
+            scaled = (d * scale.to(tl.float32)).to(DECODE_DTYPE).to(tl.float32)
+
+            qs_byte = tl.load(
+                base + 32 + (local // 128) * 32 + local % 32,
+                mask=valid, other=0,
+            )
+            ql = (qs_byte >> ((local // 32 % 4) * 2)) & 3
+            hmask_byte = tl.load(base + local % 32, mask=valid, other=0)
+            qh = ((hmask_byte >> (local // 32)) & 1) ^ 1
+            q = ql.to(tl.int32) - (qh.to(tl.int32) << 2)
+            w = (scaled * q.to(tl.float32)).to(DECODE_DTYPE)
+        elif QTYPE == 2:
             base = q_ptr + block * 210
             d = tl.load(
                 (base + 208).to(tl.pointer_type(tl.float16)), mask=valid, other=0
@@ -177,7 +207,7 @@ def linear(*, input, weight, qtype, weight_shape, bias=None, dequant_dtype="targ
         weight,
         weight_fp,
         weight_fp.numel(),
-        QTYPE={"Q4_K": 0, "Q5_K": 1, "Q6_K": 2}[qtype],
+        QTYPE={"Q4_K": 0, "Q5_K": 1, "Q6_K": 2, "Q3_K": 3}[qtype],
         DECODE_DTYPE=dtype_map[decode_dtype],
         BLOCK=block,
         num_warps=num_warps,

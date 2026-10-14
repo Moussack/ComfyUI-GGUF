@@ -34,27 +34,27 @@ For Krea 2 and Ideogram 4 models on RTX 30-series architecture, `Q8_CR` offers s
 
 ## Experimental Accelerated GGML K-Quant Linear
 
-Standard `Q4_K`, `Q5_K`, and `Q6_K` tensors retain their packed GGUF bytes and
-can use the experimental bundled Triton/CUDA backend for eligible 2-D Linear
-weights. Triton decodes super-block scales, minima, and packed values into a
+Standard `Q3_K`, `Q4_K`, `Q5_K`, and `Q6_K` tensors retain their packed GGUF
+bytes and eligible 2-D Linear operations use the experimental bundled
+Triton/CUDA backend by default. Triton decodes packed values into a
 floating-point weight, then calls the same `torch.nn.functional.linear()` as
-the portable path. This replaces the earlier fused matmul, whose accumulation
-and bias behavior differed from PyTorch. Intermediate rounding follows the
-loader's decode precision, not necessarily the activation dtype: the default
-and Dynamic VRAM paths decode in FP16 before casting, while explicit BF16,
-FP16, FP32, and `target` settings retain their existing semantics.
-The benchmark-gated selection uses FP16 or BF16 activations on CUDA SM 8.6;
-unsupported devices, activation dtypes, and shapes use the portable path.
-The backend is experimental and disabled unless
-`COMFYUI_GGUF_KQUANT_BACKEND=bundled` is set. With the variable unset (or set
-to `none`), the existing PyTorch dequantization path stays active. Current
-decode configs are restricted to a small set of measured LTX Q5_K
-and Q6_K Linear shapes, with at most 1024 activation rows, on an RTX 3080
-Laptop; all other routes use the reference path. This does not establish performance
-or correctness on the reporter's RTX 5090. Non-Linear operations, unsupported
-block alignment, active weight patches/LoRAs, and backend failures also use
-the reference path. `Q2_K`, `Q3_K`, `Q8_K`, IQ formats, and custom CR formats
-are intentionally outside this route.
+the portable path. Intermediate rounding follows the loader's decode
+precision, not necessarily the activation dtype: the default and Dynamic VRAM
+paths decode in FP16 before casting, while explicit BF16, FP16, FP32, and
+`target` settings retain their existing semantics. The backend is enabled when
+`COMFYUI_GGUF_KQUANT_BACKEND` is unset or empty; set it to `none`, `off`,
+`disabled`, or `false` before starting ComfyUI to opt out. A custom module name
+selects an alternate backend.
+
+The benchmarked selection uses FP16 or BF16 activations on CUDA SM 8.6.
+Q3_K dispatch supports 2-D Linear weights and up to 8192 activation rows;
+Q5_K/Q6_K dispatch remains restricted to the measured LTX shapes and at most
+1024 rows. Q4_K is decoder-tested but not routed in production. Unsupported
+devices, activation dtypes, shapes, operations, active weight patches/LoRAs,
+and backend failures use portable dequantization. The Krea-2 Q3_K benchmark
+showed lower latency on this RTX 3080 Laptop, but does not establish universal
+performance or correctness on the reporter's RTX 5090. `Q2_K`, `Q8_K`, IQ
+formats, and custom CR formats remain outside this route.
 
 ### K-Quant Creation
 

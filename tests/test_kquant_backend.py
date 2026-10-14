@@ -89,6 +89,7 @@ class KQuantBackendTests(unittest.TestCase):
 
     def test_static_linear_sends_all_supported_k_quants_directly_to_backend(self):
         for qtype in (
+            gguf.GGMLQuantizationType.Q3_K,
             gguf.GGMLQuantizationType.Q4_K,
             gguf.GGMLQuantizationType.Q5_K,
             gguf.GGMLQuantizationType.Q6_K,
@@ -218,7 +219,27 @@ class KQuantBackendTests(unittest.TestCase):
             torch.nn.functional.linear(torch.ones((1, 256)), weight)
         self.assertEqual(backend.calls, [])
 
-    def test_default_disabled_backend_uses_cpu_dequantized_fallback(self):
+    def test_default_cpu_linear_imports_backend_then_uses_portable_fallback(self):
+        self.backend_module.register_kquant_backend(None)
+        linear, _ = self.static_linear(gguf.GGMLQuantizationType.Q6_K)
+        input_tensor = torch.ones((1, 256), dtype=torch.float32)
+
+        with mock.patch.dict("os.environ", {}, clear=True):
+            with mock.patch.object(
+                self.backend_module.importlib,
+                "import_module",
+                wraps=self.backend_module.importlib.import_module,
+            ) as import_module:
+                output = linear.forward_ggml_cast_weights(input_tensor)
+
+        import_module.assert_called_once_with(
+            self.backend_module._LOCAL_BACKEND_MODULE,
+            package=self.backend_module.__package__,
+        )
+        self.assertEqual(output.device.type, "cpu")
+        self.assertTrue(torch.equal(output, torch.zeros_like(output)))
+
+    def test_explicit_opt_out_backend_uses_cpu_dequantized_fallback(self):
         self.backend_module.register_kquant_backend(None)
         qtype = gguf.GGMLQuantizationType.Q6_K
         weight = self.quant_ops.make_quantized(
@@ -229,7 +250,7 @@ class KQuantBackendTests(unittest.TestCase):
         )
         input_tensor = torch.ones((1, 256), dtype=torch.float32)
 
-        with mock.patch.dict("os.environ", {self.backend_module._BACKEND_ENV: ""}):
+        with mock.patch.dict("os.environ", {self.backend_module._BACKEND_ENV: "none"}):
             with mock.patch.object(
                 self.backend_module.importlib, "import_module"
             ) as import_module:
@@ -239,12 +260,14 @@ class KQuantBackendTests(unittest.TestCase):
         self.assertEqual(output.device.type, "cpu")
         self.assertTrue(torch.equal(output, torch.zeros_like(output)))
 
-    def test_static_linear_uses_portable_fallback_when_backend_is_disabled(self):
+    def test_static_linear_uses_portable_fallback_when_backend_is_opted_out(self):
         self.backend_module.register_kquant_backend(None)
         linear, _ = self.static_linear(gguf.GGMLQuantizationType.Q5_K)
         input_tensor = torch.ones((1, 256), dtype=torch.float32)
 
-        with mock.patch.dict("os.environ", {}, clear=True):
+        with mock.patch.dict(
+            "os.environ", {self.backend_module._BACKEND_ENV: "none"}
+        ):
             with mock.patch.object(
                 self.backend_module.importlib, "import_module"
             ) as import_module:
@@ -253,8 +276,8 @@ class KQuantBackendTests(unittest.TestCase):
         import_module.assert_not_called()
         self.assertTrue(torch.equal(output, torch.zeros_like(output)))
 
-    def test_backend_is_disabled_by_default_and_explicit_off_values(self):
-        for setting in ("", "none", "off", "disabled", "false"):
+    def test_backend_can_be_opted_out_with_explicit_off_values(self):
+        for setting in ("none", "off", "disabled", "false"):
             with self.subTest(setting=setting):
                 self.backend_module.register_kquant_backend(None)
                 with mock.patch.dict(
@@ -266,25 +289,33 @@ class KQuantBackendTests(unittest.TestCase):
                         self.assertIsNone(self.backend_module._load_backend())
                 import_module.assert_not_called()
 
-    def test_bundled_backend_requires_explicit_opt_in(self):
-        self.backend_module.register_kquant_backend(None)
+    def test_default_and_explicit_bundled_selection(self):
         backend = FakeKQuantBackend()
-        module = types.SimpleNamespace(__name__="test_bundled_backend", backend=backend)
-
-        with mock.patch.dict(
-            "os.environ", {self.backend_module._BACKEND_ENV: "bundled"}
-        ):
-            with mock.patch.object(
-                self.backend_module.importlib,
-                "import_module",
-                return_value=module,
-            ) as import_module:
-                self.assertIs(backend, self.backend_module._load_backend())
-
-        import_module.assert_called_once_with(
-            self.backend_module._LOCAL_BACKEND_MODULE,
-            package=self.backend_module.__package__,
+        module = types.SimpleNamespace(
+            __name__="test_bundled_backend", backend=backend
         )
+
+        for environment in (
+            {},
+            {self.backend_module._BACKEND_ENV: ""},
+            {self.backend_module._BACKEND_ENV: "bundled"},
+        ):
+            with self.subTest(
+                setting=environment.get(self.backend_module._BACKEND_ENV, "unset")
+            ):
+                self.backend_module.register_kquant_backend(None)
+                with mock.patch.dict("os.environ", environment, clear=True):
+                    with mock.patch.object(
+                        self.backend_module.importlib,
+                        "import_module",
+                        return_value=module,
+                    ) as import_module:
+                        self.assertIs(backend, self.backend_module._load_backend())
+
+                import_module.assert_called_once_with(
+                    self.backend_module._LOCAL_BACKEND_MODULE,
+                    package=self.backend_module.__package__,
+                )
 
     def test_invalid_k_quant_storage_never_reaches_backend(self):
         backend = FakeKQuantBackend()
@@ -302,12 +333,15 @@ class KQuantBackendTests(unittest.TestCase):
         self.assertEqual(backend.calls, [])
 
     @mock.patch("torch.cuda.get_device_capability", return_value=(8, 6))
-    def test_bundled_triton_launch_config_is_limited_to_benchmarked_routes(self, capability):
+    def test_bundled_triton_launch_config_respects_device_dtype_and_row_limits(self, capability):
         module = importlib.import_module(
             ".kquant_triton_backend", package=self.backend_module.__package__
         )
         device = torch.device("cuda")
         cases = (
+            ("Q3_K", (6144, 6144), 4096, (256, 4)),
+            ("Q3_K", (6144, 6144), 8192, (256, 4)),
+            ("Q3_K", (6144, 6144), 8193, None),
             ("Q5_K", (16384, 4096), 16, (256, 4)),
             ("Q5_K", (16384, 4096), 64, (256, 4)),
             ("Q5_K", (16384, 4096), 128, (256, 4)),
@@ -367,34 +401,13 @@ class KQuantBackendTests(unittest.TestCase):
 
         torch.manual_seed(26)
         for qtype in (
+            gguf.GGMLQuantizationType.Q3_K,
             gguf.GGMLQuantizationType.Q4_K,
             gguf.GGMLQuantizationType.Q5_K,
             gguf.GGMLQuantizationType.Q6_K,
         ):
             with self.subTest(qtype=qtype.name):
-                _, type_size = gguf.GGML_QUANT_SIZES[qtype]
-                raw = torch.randint(
-                    0, 256, (3, 2 * type_size), device="cuda", dtype=torch.uint8
-                )
-                for offset in (0, type_size):
-                    if qtype == gguf.GGMLQuantizationType.Q6_K:
-                        raw[:, offset + 192 : offset + 208] = torch.randint(
-                            -4,
-                            5,
-                            (3, 16),
-                            device="cuda",
-                            dtype=torch.int16,
-                        ).to(torch.uint8)
-                        raw[:, offset + 208] = 0
-                        raw[:, offset + 209] = 56
-                    else:
-                        raw[:, offset] = 0
-                        raw[:, offset + 1] = 60
-                        raw[:, offset + 2] = 0
-                        raw[:, offset + 3] = 56
-                        raw[:, offset + 4 : offset + 16] = torch.randint(
-                            0, 256, (3, 12), device="cuda", dtype=torch.uint8
-                        )
+                raw = self.random_k_storage(qtype, (3, 512))
 
                 for input_dtype in (torch.float16, torch.bfloat16, torch.float32):
                     with self.subTest(input_dtype=input_dtype):
@@ -538,14 +551,22 @@ class KQuantBackendTests(unittest.TestCase):
             device="cuda", dtype=torch.uint8,
         )
         blocks = raw.reshape(-1, type_size)
-        d_offset = 208 if qtype == gguf.GGMLQuantizationType.Q6_K else 0
+        if qtype == gguf.GGMLQuantizationType.Q6_K:
+            d_offset = 208
+        elif qtype == gguf.GGMLQuantizationType.Q3_K:
+            d_offset = 108
+        else:
+            d_offset = 0
         scales = torch.linspace(
             0.000171, 0.00137, blocks.shape[0], device="cuda", dtype=torch.float32
         ).to(torch.float16)
         if not torch.isfinite(scales).all():
             raise ValueError("Synthetic K-quant scales must be finite")
         blocks[:, d_offset:d_offset + 2] = scales.view(torch.uint8).reshape(-1, 2)
-        if d_offset == 0:
+        if qtype in (
+            gguf.GGMLQuantizationType.Q4_K,
+            gguf.GGMLQuantizationType.Q5_K,
+        ):
             minimum = (scales * 0.713).contiguous()
             blocks[:, 2:4] = minimum.view(torch.uint8).reshape(-1, 2)
         return raw
@@ -561,6 +582,7 @@ class KQuantBackendTests(unittest.TestCase):
 
         torch.manual_seed(2626)
         for qtype in (
+            gguf.GGMLQuantizationType.Q3_K,
             gguf.GGMLQuantizationType.Q4_K,
             gguf.GGMLQuantizationType.Q5_K,
             gguf.GGMLQuantizationType.Q6_K,
@@ -595,16 +617,17 @@ class KQuantBackendTests(unittest.TestCase):
         from dequant import dequantize
 
         torch.manual_seed(2609)
-        for qtype, shape in (
-            (gguf.GGMLQuantizationType.Q5_K, (4096, 4096)),
-            (gguf.GGMLQuantizationType.Q5_K, (16384, 4096)),
-            (gguf.GGMLQuantizationType.Q6_K, (4096, 16384)),
+        for qtype, shape, m_sizes in (
+            (gguf.GGMLQuantizationType.Q3_K, (5, 768), (4096, 8192)),
+            (gguf.GGMLQuantizationType.Q5_K, (4096, 4096), (65, 257, 1024)),
+            (gguf.GGMLQuantizationType.Q5_K, (16384, 4096), (65, 257, 1024)),
+            (gguf.GGMLQuantizationType.Q6_K, (4096, 16384), (65, 257, 1024)),
         ):
             raw = self.random_k_storage(qtype, shape)
             for dtype in (torch.float16, torch.bfloat16):
                 for decode_dtype in (None, torch.bfloat16, torch.float32):
                     reference_weight = dequantize(raw, qtype, shape, dtype=decode_dtype).to(dtype)
-                    for m_size in (65, 257, 1024):
+                    for m_size in m_sizes:
                         with self.subTest(qtype=qtype.name, shape=shape, dtype=dtype,
                                           decode_dtype=decode_dtype, m_size=m_size):
                             x = torch.randn(m_size, shape[1], device="cuda", dtype=dtype)
@@ -660,6 +683,43 @@ class KQuantBackendTests(unittest.TestCase):
                     torch.addmm(bias, x, weight.t()),
                     torch.addmm(bias, x, weight.dequantize().t()),
                 ))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for the bundled Triton backend")
+    @mock.patch.dict("os.environ", {"COMFYUI_GGUF_KQUANT_BACKEND": "bundled"})
+    def test_bundled_q3_static_and_dynamic_layers_match_portable_operations(self):
+        self.backend_module.register_kquant_backend(None)
+        torch.manual_seed(2631)
+        qtype = gguf.GGMLQuantizationType.Q3_K
+        shape = (5, 768)
+        raw = self.random_k_storage(qtype, shape)
+        for dtype in (torch.float16, torch.bfloat16):
+            x = torch.randn(4096, shape[1], device="cuda", dtype=dtype)
+            bias = torch.randn(shape[0], device="cuda", dtype=dtype)
+            layer = self.ops.GGMLOps.Linear(shape[1], shape[0], dtype=dtype)
+            layer.weight = torch.nn.Parameter(
+                self.ops.GGMLTensor(
+                    raw, tensor_type=qtype, tensor_shape=shape, compute_dtype=dtype
+                ), requires_grad=False,
+            )
+            layer.bias = torch.nn.Parameter(bias, requires_grad=False)
+            for decode_dtype in (None, "target", torch.bfloat16, torch.float32):
+                with self.subTest(dtype=dtype, decode_dtype=decode_dtype):
+                    layer.dequant_dtype = decode_dtype
+                    weight_fp, bias_fp = layer.cast_bias_weight(x)
+                    reference = torch.nn.functional.linear(x, weight_fp, bias_fp)
+                    output = layer.forward_ggml_cast_weights(x)
+                    self.assertTrue(torch.equal(output, reference))
+
+            weight = self.quant_ops.make_quantized(raw, qtype, shape, orig_dtype=dtype)
+            reference_weight = weight.dequantize()
+            reference = torch.nn.functional.linear(x, reference_weight, bias)
+            self.assertTrue(torch.equal(torch.nn.functional.linear(x, weight, bias), reference))
+            self.assertTrue(torch.equal(
+                torch.mm(x, weight.t()), torch.mm(x, reference_weight.t())
+            ))
+            self.assertTrue(torch.equal(
+                torch.addmm(bias, x, weight.t()), torch.addmm(bias, x, reference_weight.t())
+            ))
 
 
 if __name__ == "__main__":
