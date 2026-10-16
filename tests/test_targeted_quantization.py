@@ -683,6 +683,109 @@ class Flux3ConversionTests(unittest.TestCase):
             gguf.GGMLQuantizationType.F32,
         )
 
+    def test_q4_cr_and_q4_cr_l_promote_sensitive_flux3_layers_and_unrotate_q8_cr(self):
+        torch.manual_seed(7)
+        orig_txt_in = torch.randn((16, 256), dtype=torch.bfloat16)
+        orig_attn_out = torch.randn((16, 256), dtype=torch.bfloat16)
+        state_dict = {
+            "content_mode_blocks.image.0.attn_out.weight": orig_attn_out,
+            "content_mode_blocks.image.0.v_proj.weight": torch.randn((16, 256), dtype=torch.bfloat16),
+            "content_mode_blocks.image_cond.0.attn_out.weight": torch.randn((16, 256), dtype=torch.bfloat16),
+            "txt_mode_blocks.0.attn_out.weight": torch.randn((16, 256), dtype=torch.bfloat16),
+            "content_mode_blocks.image.0.norm.query_norm.scale": torch.ones(64, dtype=torch.bfloat16),
+            "emb_in.0.weight": torch.ones((16, 128), dtype=torch.bfloat16),
+            "time_in.in_layer.weight": torch.randn((16, 256), dtype=torch.bfloat16),
+            "ref_time_in.in_layer.weight": torch.randn((16, 256), dtype=torch.bfloat16),
+            "txt_in.weight": orig_txt_in,
+            "early_stream_modulations.img.lin.weight": torch.randn((16, 256), dtype=torch.bfloat16),
+            "single_stream_modulations.txt.lin.weight": torch.randn((16, 256), dtype=torch.bfloat16),
+            "single_stream_blocks.0.linear1.weight": torch.randn((16, 256), dtype=torch.bfloat16),
+            "final_layer.image.adaLN_modulation.1.weight": torch.randn((16, 256), dtype=torch.bfloat16),
+            "final_layer.image.linear.weight": torch.randn((8, 256), dtype=torch.bfloat16),
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "flux3.safetensors"
+            q4_cr_path = Path(temp_dir) / "flux3-Q4_CR.gguf"
+            q4_cr_l_path = Path(temp_dir) / "flux3-Q4_CR_L.gguf"
+            save_file(state_dict, str(source_path))
+
+            convert_file(
+                str(source_path),
+                str(q4_cr_path),
+                interact=False,
+                quant_type_name="Q4_CR",
+                quantization_device="cpu",
+            )
+            convert_file(
+                str(source_path),
+                str(q4_cr_l_path),
+                interact=False,
+                quant_type_name="Q4_CR_L",
+                quantization_device="cpu",
+            )
+
+            self.assertGreater(q4_cr_l_path.stat().st_size, q4_cr_path.stat().st_size)
+
+            loader = load_gguf_loader()
+            sd_cr, extra_cr = loader.gguf_sd_loader(str(q4_cr_path), dynamic=False)
+            sd_crl, extra_crl = loader.gguf_sd_loader(str(q4_cr_l_path), dynamic=False)
+
+            self.assertEqual(extra_cr["gguf_quant_mode"], "int4_cr_w4a4")
+            self.assertEqual(extra_crl["gguf_quant_mode"], "int4_cr_w4a8")
+
+            for sd in (sd_cr, sd_crl):
+                self.assertEqual(
+                    sd["content_mode_blocks.image.0.norm.query_norm.scale"].tensor_type,
+                    gguf.GGMLQuantizationType.F32,
+                )
+                self.assertEqual(
+                    sd["final_layer.image.linear.weight"].tensor_type,
+                    gguf.GGMLQuantizationType.F32,
+                )
+                self.assertEqual(sd["emb_in.0.weight"].dtype, torch.bfloat16)
+                txt_conf = json.loads(bytes(sd["txt_in.comfy_quant"].tolist()).decode("utf-8"))
+                self.assertEqual(txt_conf["format"], "int8_tensorwise")
+
+            img_attn_conf_cr = json.loads(
+                bytes(sd_cr["content_mode_blocks.image.0.attn_out.comfy_quant"].tolist()).decode("utf-8")
+            )
+            v_conf_cr = json.loads(
+                bytes(sd_cr["content_mode_blocks.image.0.v_proj.comfy_quant"].tolist()).decode("utf-8")
+            )
+            v_conf_crl = json.loads(
+                bytes(sd_crl["content_mode_blocks.image.0.v_proj.comfy_quant"].tolist()).decode("utf-8")
+            )
+            txt_attn_conf_cr = json.loads(
+                bytes(sd_cr["txt_mode_blocks.0.attn_out.comfy_quant"].tolist()).decode("utf-8")
+            )
+            txt_attn_conf_crl = json.loads(
+                bytes(sd_crl["txt_mode_blocks.0.attn_out.comfy_quant"].tolist()).decode("utf-8")
+            )
+            self.assertEqual(img_attn_conf_cr["format"], "int8_tensorwise")
+            self.assertEqual(v_conf_cr["format"], "int4_cr")
+            self.assertEqual(v_conf_cr["backing"], "w4a4")
+            self.assertEqual(v_conf_crl["format"], "int8_tensorwise")
+            self.assertEqual(txt_attn_conf_cr["format"], "int4_cr")
+            self.assertEqual(txt_attn_conf_crl["format"], "int8_tensorwise")
+
+            # Verify GGUFQ4W4A4Ops.Linear un-rotates mixed int8_tensorwise (Q8_CR) layers on load
+            ops = ops_factory(default_linear_dtype="int8")
+            lin = ops.Linear(256, 16, bias=False)
+            lin._load_from_state_dict(
+                sd_crl,
+                prefix="txt_in.",
+                local_metadata={},
+                strict=True,
+                missing_keys=[],
+                unexpected_keys=[],
+                error_msgs=[],
+            )
+            rel_err = (lin.weight.float() - orig_txt_in.float()).norm() / orig_txt_in.float().norm()
+            self.assertLess(rel_err.item(), 0.02)
+            del sd, sd_cr, sd_crl, lin
+            gc.collect()
+
 
 class QwenImage21ConversionTests(unittest.TestCase):
     def test_detects_qwen_image_21_from_distinctive_dit_keys(self):

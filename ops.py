@@ -248,10 +248,9 @@ def _perf_forward(mode, layer, input_tensor, operation):
 
 def _build_regular_hadamard(size, dtype=torch.float32, device="cpu"):
     """Build a normalized regular (Sylvester) Hadamard of a power-of-4 size."""
-    if size < 4 or (size & (size - 1)) != 0:
-        import math
-        if not math.log(size, 4).is_integer():
-            raise ValueError(f"Regular Hadamard size must be a power of 4, got {size}")
+    import math
+    if size < 4 or (size & (size - 1)) != 0 or not math.log(size, 4).is_integer():
+        raise ValueError(f"Regular Hadamard size must be a power of 4, got {size}")
     h4 = torch.tensor(
         [[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]],
         dtype=dtype,
@@ -843,10 +842,24 @@ def get_gguf_q4_w4a4_ops(
                     if weight.ndim != 2 or scale.numel() != weight.shape[0]:
                         raise ValueError(f"Invalid mixed INT8 tensors for {prefix}")
                     materialize_dtype = self._compute_dtype or dtype or torch.bfloat16
+                    w_float = weight.to(dtype=torch.float32) * scale.to(
+                        device=weight.device, dtype=torch.float32
+                    ).reshape(weight.shape[0], 1)
+                    if quant_conf.get("convrot", False) and quant_conf.get("weight_rotated", True):
+                        groupsize = int(quant_conf.get("convrot_groupsize", 256))
+                        if w_float.shape[1] % groupsize != 0:
+                            raise ValueError(
+                                f"Invalid ConvRot groupsize {groupsize} for {prefix} shape {tuple(w_float.shape)}"
+                            )
+                        had = _build_regular_hadamard(
+                            groupsize, dtype=torch.float32, device=w_float.device
+                        )
+                        w_float = torch.matmul(
+                            w_float.reshape(w_float.shape[0], -1, groupsize),
+                            had,
+                        ).reshape(w_float.shape)
                     self.weight = torch.nn.Parameter(
-                        weight.to(dtype=materialize_dtype) * scale.to(
-                            device=weight.device, dtype=materialize_dtype
-                        ).reshape(weight.shape[0], 1),
+                        w_float.to(dtype=materialize_dtype),
                         requires_grad=False,
                     )
                     self._quantized = False
@@ -1335,7 +1348,13 @@ def get_gguf_q4_w4a4_ops(
                             bias = f(bias)
                 if not self._quantized or self.weight is None:
                     # Plain Linear path
-                    weight = self.weight.to(device=input.device, dtype=input.dtype)
+                    weight = (
+                        self.weight.to(device=input.device, dtype=input.dtype)
+                        if self.weight is not None else None
+                    )
+                    if weight is not None:
+                        for f in getattr(self, "weight_function", ()):
+                            weight = f(weight)
                     return torch.nn.functional.linear(input, weight, bias)
                 if self._default_linear_dtype == "int8" and input.device.type != "cuda":
                     warn_w4a8_dense_fallback()

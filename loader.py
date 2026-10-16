@@ -350,7 +350,7 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
                 quant_conf.pop("convrot_groupsize", None)
             elif quant_conf.get("convrot"):
                 groupsize = quant_conf.get("convrot_groupsize", 256)
-                weight_shape = weight_ggml.shape if dynamic else weight_ggml.tensor_shape
+                weight_shape = getattr(weight_ggml, "tensor_shape", weight_ggml.shape)
                 if weight_shape[-1] % groupsize != 0:
                     logging.warning(
                         "Disabling ConvRot for %s because %d input features are not "
@@ -363,12 +363,10 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
                     quant_conf.pop("convrot_groupsize", None)
 
             # Convert to ComfyUI native state-dict layout
-            if dynamic:
-                weight = weight_ggml.view(torch.int8).reshape(weight_ggml.shape)
-                scale = scale_ggml.view(torch.float32).reshape(scale_ggml.shape)
-            else:
-                weight = weight_ggml.data.view(torch.int8).reshape(weight_ggml.tensor_shape)
-                scale = scale_ggml.data.view(torch.float32).reshape(scale_ggml.tensor_shape)
+            weight_shape = getattr(weight_ggml, "tensor_shape", weight_ggml.shape)
+            scale_shape = getattr(scale_ggml, "tensor_shape", scale_ggml.shape)
+            weight = weight_ggml.data.view(torch.int8).reshape(weight_shape)
+            scale = scale_ggml.data.view(torch.float32).reshape(scale_shape)
 
             state_dict[weight_key] = torch.nn.Parameter(weight, requires_grad=False)
             state_dict[scale_key] = torch.nn.Parameter(scale, requires_grad=False)
@@ -413,12 +411,8 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
                 )
             packed_shape = (orig_shape[0], orig_shape[1] // 2)
 
-            if dynamic:
-                packed = weight_ggml.view(torch.int8).reshape(packed_shape)
-                scale = scale_ggml.view(torch.float16).to(torch.bfloat16).reshape(orig_shape[0])
-            else:
-                packed = weight_ggml.data.view(torch.int8).reshape(packed_shape)
-                scale = scale_ggml.data.view(torch.float16).to(torch.bfloat16).reshape(orig_shape[0])
+            packed = weight_ggml.data.view(torch.int8).reshape(packed_shape)
+            scale = scale_ggml.data.view(torch.float16).to(torch.bfloat16).reshape(orig_shape[0])
 
             layer_prefix = weight_key[:weight_key.rfind("weight")]
 
