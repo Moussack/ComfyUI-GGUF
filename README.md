@@ -24,8 +24,6 @@ To install the custom node normally, git clone this repository into your custom 
 git clone https://github.com/molbal/ComfyUI-GGUF
 ```
   
-
-
 ## Usage  
   
 Simply use the GGUF Unet loader found under the `bootleg` category. Place the .gguf model files in your `ComfyUI/models/unet` folder.  
@@ -42,35 +40,10 @@ Pre-quantized models (🍴 icon on ones added by this fork):
 - [MiniMax Music3](https://huggingface.co/molbal/Minimax-Music3-GGUF) 🍴  
 - [LTX 2.5](https://huggingface.co/molbal/LTX-2.5-GGUF) 🍴  
 - [Qwen Image 2.1](https://huggingface.co/molbal/Qwen-Image-2.1-GGUF) 🍴  
+- [Flux3 Klein](https://huggingface.co/molbal/Flux-3-Klein-GGUF) 🍴  
 
-### FLUX 3 Image Klein
 
-Both FLUX 3 Image Klein base and distilled checkpoints are supported by the GGUF converter and UNet loaders when using ComfyUI v0.41.0 or later. The architecture uses ComfyUI's native `flux3` runtime; conversion preserves its tensor names and shapes. Create a native INT8 ConvRot (`Q8_CR`) model with:
-
-```powershell
-python tools\convert.py --src "D:\path\to\flux3_image_klein_sd_bf16.safetensors" --dst "D:\path\to\flux3_image_klein_sd-Q8_CR.gguf" --quant-type Q8_CR --streamed
-```
-
-Choose the base checkpoint instead by changing the source and output names. One-dimensional normalization tensors remain FP32. With standard K-quants such as `Q4_K_M` and `Q6_K`, the image and reference-image input projections stay in source BF16 because their 128-wide input dimension does not satisfy GGML's 256-value K-block requirement. Q8_CR uses its separate INT8 ConvRot format for eligible two-dimensional Linear weights. Load the result with either GGUF UNet loader. Native INT8 execution depends on ComfyUI's TensorWiseINT8 layout and compatible `comfy_kitchen` kernels; the loader falls back to portable dequantized compute when that path is unavailable. This does not quantize the separate Qwen text encoder or prompt upsampler.
-
-### Qwen Image 2.1 FP16 fallback
-
-The GGUF UNet loaders automatically use FP16 model and manual-cast dtypes for
-Qwen Image 2.1 when the active device lacks native BF16 but ComfyUI reports
-that FP16 is supported. BF16-capable devices keep the existing BF16 behavior.
-This fallback applies only to Qwen Image 2.1 GGUF models; regular checkpoint
-loading is unchanged, and explicit ComfyUI FP32, BF16, or FP8 UNet overrides
-are respected. Sensitive one-dimensional BF16 tensors remain FP32.
-
-ComfyUI currently lists only BF16 and FP32 as supported inference dtypes for
-Qwen Image 2.1, so the GGUF fallback intentionally overrides that restriction.
-FP16 may change output numerics or stability; validate it with your model and
-workflow. If ComfyUI considers FP16 unsupported on the device, it retains the
-existing fallback instead. Standard GGML quantized weights are still
-materialized for PyTorch compute; this change does not add native low-bit
-inference.
-
-Initial support for quantizing T5 has also been added, these can be used using the various `*CLIPLoader (gguf)` nodes which can be used inplace of the regular ones. For the CLIP model, use whatever model you were using before for CLIP. The loader can handle both types of files - `gguf` and regular `safetensors`/`bin`.  
+Support for quantizing T5 has also been added, these can be used using the various `*CLIPLoader (GGUF)` nodes which can be used inplace of the regular ones. For the CLIP model, use whatever model you were using before for CLIP. The loader can handle both types of files - `gguf` and regular `safetensors`/`bin`.  
   
 - [t5_v1.1-xxl GGUF](https://huggingface.co/city96/t5-v1_1-xxl-encoder-gguf)  
 - [Qwen3-VL-4B-Instruct-GGUF](https://huggingface.co/Qwen/Qwen3-VL-4B-Instruct-GGUF) 🍴  
@@ -79,61 +52,6 @@ Initial support for quantizing T5 has also been added, these can be used using t
 - [Qwen3.5 GGUF](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF) text encoders (0.8B, 2B, 4B, 9B, and 27B) with a ComfyUI build containing Qwen3.5 TE support. Place the matching `mmproj-*.gguf` beside the text encoder for image conditioning; text-only workflows do not need it. 🍴  
 - [Gemma 4 GGUF](https://huggingface.co/unsloth/gemma-4-E4B-it-qat-GGUF) text encoders (E2B, E4B, 12B, and 31B) with ComfyUI v0.30.0 or later. 🍴
 
-### Qwen3-VL 4B text-only Q8_CR
-
-Currently, conversion supports only the official Comfy-Org BF16 checkpoint
-[`qwen3vl_4b_bf16.safetensors`](https://huggingface.co/Comfy-Org/Qwen3-VL/blob/main/text_encoders/qwen3vl_4b_bf16.safetensors)
-and validates the language tensor names/shapes, visual-tensor count and
-signature shapes, and BF16 dtypes. It produces a text-only Q8_CR GGUF by
-deliberately dropping the vision tower; the result cannot process
-images or use an MMProj sidecar, and non-Q8_CR conversion settings are rejected.
-
-From the ComfyUI-GGUF repository root using the ComfyUI Python environment, set
-`$comfyRoot` to your ComfyUI installation and run:
-
-```powershell
-$comfyRoot = "D:\path\to\ComfyUI"
-python tools\convert.py --src "$comfyRoot\models\text_encoders\qwen3vl_4b_bf16.safetensors" --dst "$comfyRoot\models\text_encoders\qwen3vl_4b_bf16-Q8_CR.gguf" --quant-type Q8_CR --streamed
-```
-
-Load the resulting file by itself with **CLIPLoader (GGUF, Dynamic VRAM)**.
-Static and legacy GGUF CLIP loaders reject Q8_CR text encoders. The Dynamic
-VRAM runtime is required; within it, native INT8 TensorWise execution is
-selected only on CUDA Ampere or newer GPUs (compute capability 8.0+) when
-ComfyUI exposes its TensorWiseINT8 layout and a working `comfy_kitchen` kernel.
-If Dynamic VRAM is available but the GPU/kernel cannot use that route—or a
-native kernel fails—the loader restores the weights for dequantized
-higher-precision execution. This fallback is not native INT8. The ComfyUI
-checkout must include the Qwen3-VL 4B text-encoder runtime (commit
-[`fc964047`](https://github.com/comfyanonymous/ComfyUI/commit/fc964047e7f6e837eca776e7c34706c04690ecfd)
-or later). The native INT8 route additionally depends on the compatible
-Dynamic VRAM / TensorWiseINT8 runtime and CUDA kernel being installed.
-
-An opt-in BF16-vs-Q8_CR benchmark is available in this package:
-
-```powershell
-python tools\benchmark_qwen3vl_text_encoder.py --source "$comfyRoot\models\text_encoders\qwen3vl_4b_bf16.safetensors" --quantized "$comfyRoot\models\text_encoders\qwen3vl_4b_bf16-Q8_CR.gguf" --runs 10 --warmup 2 --output qwen3vl-4b-q8-cr-benchmark.json
-```
-
-Run it from the ComfyUI-GGUF repository using the ComfyUI Python environment.
-It reports load, first-use and warm text-encode latency separately, CUDA
-peak-memory measurements, native/fallback execution counts and output
-similarity. The BF16 baseline is the full multimodal checkpoint while the GGUF
-is text-only, so this is not a like-for-like storage or multimodal benchmark;
-results are specific to the reported hardware, runtime, prompts and offload
-settings.
-
-For transparency, one 40-encode-per-model run (10 per prompt, 23–416 tokens)
-on an RTX 3080 Laptop GPU (compute capability 8.6, PyTorch 2.14.0+cu130, CUDA
-13.0, ComfyUI `88ab4a0`, CPU offload) measured a 489.935 ms BF16 warm median
-and a 461.125 ms Q8_CR median; Q8_CR was about 5.9% faster in this workload.
-The benchmark observed 12,348 native TensorWiseINT8 Linear calls and no
-fallback. Peak CUDA allocation while encoding was about 150 MiB for BF16 and
-1,497 MiB for Q8_CR in these CPU-offload runs. Tokenization matched, but output
-relative L2 error was 10.2–11.9%, and thelargest absolute difference was about 156 (5.09% of the BF16 output's maximum
-absolute value). Treat this as a single, workload-specific measurement—not a
-speed or quality guarantee. The BF16 baseline retains the full vision tower,
-whereas the converted GGUF is text-only.
 
 ## Converting Models (Krea 2, Ideogram 4, MiniMax H3, MiniMax Music 3, Qwen Image 2.1, Qwen3-VL 4B)
 
@@ -161,25 +79,15 @@ Each option is documented here: [Quantizing models](https://molbal.github.io/ggu
 | Q4_K   | Uniform GGML K 4-bit      | Uniform 4-bit K-quant storage.                               |
 | Q4_K_S / Q4_K_M | Mixed GGML K     | Deterministic 4/5/6-bit distributions; `_M` protects more sensitive tensors. |
 | Q8_CR  | Per-row INT8 ConvRot      | Maintainer recommendation for NVIDIA RTX 30-series systems. |
-| Q4_CR_W4A4 | Per-row packed INT4, INT4 activations | Existing W4A4 format; `Q4_CR` remains its alias. |
+| Q4_CR | Per-row packed INT4, INT4 activations | Existing W4A4 format; `Q4_CR` remains its alias. |
 | Q4_CR_L | Per-row packed INT4, INT8 activations | Opt-in W4A8 execution using the same packed weight storage. |
 
-Select `Q4_CR_L` with `--quant-type Q4_CR_L` to use INT4 weights with INT8
-activations; this does not change the existing `Q4_CR` / `Q4_CR_W4A4` behavior.
-Both use `TensorCoreConvRotW4A4Layout` storage. The W4A8 CUDA route is provided
-by `comfy_kitchen`'s ConvRot kernel (`linear_dtype="int8"`), not by the separate
-Triton codebook W4A8 layout. When that CUDA route is unavailable, the loader
-uses dense dequantized PyTorch compute rather than mislabeling the eager W4A4
-fallback as W4A8. Standard runtime LoRAs retain the packed base and add a
-low-rank correction when supported; other patch types use the existing
-compute-dtype fused cache.
+## K-quant acceleration
 
-K-quant creation uses the GGML-compatible deterministic encoder bundled with
+K-quant creation uses the GGML-compatible encoder bundled with
 this converter and requires every selected row to be divisible by 256.
-Architecture-protected, convolution, small, and one-dimensional tensors retain
-higher precision. The local encoder is used even when the installed `gguf`
-Python package only supports reading K quants; output is still validated against
-the repository’s reference dequantizer.
+Sensitive, convolution, small, and one-dimensional tensors retain
+higher precision. 
 
 For eligible K-quant Linear operations, the experimental bundled Triton/CUDA
 backend is enabled by default; unsupported routes continue to use portable
@@ -189,10 +97,4 @@ Q3_K is supported on CUDA SM 8.6 with FP16/BF16 activations and up to 8192 rows;
 Q5_K/Q6_K remain limited to measured LTX matrix shapes and at most 1024 rows.
 Set `COMFYUI_GGUF_KQUANT_BACKEND=none` before starting ComfyUI to opt out.
 
-In a warmed Krea-2 Turbo Q3_K_M benchmark (1024x1024, 9-step
-`er_sde`/`simple`) on a local RTX 3080 Laptop, the bundled path measured a
-56.90 s median versus 86.43 s with the backend off across three pairs, with
-bit-identical outputs. All three bundled runs were faster, but the GPU was not
-fully idle and backend-off times varied substantially. Treat this as
-best-effort local evidence, not a general speed claim. See
-[K-quant inference notes](docs/k-quant-inference.md) for details.
+See [K-quant inference notes](docs/k-quant-inference.md) for details.
