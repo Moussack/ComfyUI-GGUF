@@ -43,6 +43,16 @@ Pre-quantized models (🍴 icon on ones added by this fork):
 - [LTX 2.5](https://huggingface.co/molbal/LTX-2.5-GGUF) 🍴  
 - [Qwen Image 2.1](https://huggingface.co/molbal/Qwen-Image-2.1-GGUF) 🍴  
 
+### FLUX 3 Image Klein
+
+Both FLUX 3 Image Klein base and distilled checkpoints are supported by the GGUF converter and UNet loaders when using ComfyUI v0.41.0 or later. The architecture uses ComfyUI's native `flux3` runtime; conversion preserves its tensor names and shapes. Create a native INT8 ConvRot (`Q8_CR`) model with:
+
+```powershell
+python tools\convert.py --src "D:\path\to\flux3_image_klein_sd_bf16.safetensors" --dst "D:\path\to\flux3_image_klein_sd-Q8_CR.gguf" --quant-type Q8_CR --streamed
+```
+
+Choose the base checkpoint instead by changing the source and output names. One-dimensional normalization tensors remain FP32. With standard K-quants such as `Q4_K_M` and `Q6_K`, the image and reference-image input projections stay in source BF16 because their 128-wide input dimension does not satisfy GGML's 256-value K-block requirement. Q8_CR uses its separate INT8 ConvRot format for eligible two-dimensional Linear weights. Load the result with either GGUF UNet loader. Native INT8 execution depends on ComfyUI's TensorWiseINT8 layout and compatible `comfy_kitchen` kernels; the loader falls back to portable dequantized compute when that path is unavailable. This does not quantize the separate Qwen text encoder or prompt upsampler.
+
 ### Qwen Image 2.1 FP16 fallback
 
 The GGUF UNet loaders automatically use FP16 model and manual-cast dtypes for
@@ -151,7 +161,18 @@ Each option is documented here: [Quantizing models](https://molbal.github.io/ggu
 | Q4_K   | Uniform GGML K 4-bit      | Uniform 4-bit K-quant storage.                               |
 | Q4_K_S / Q4_K_M | Mixed GGML K     | Deterministic 4/5/6-bit distributions; `_M` protects more sensitive tensors. |
 | Q8_CR  | Per-row INT8 ConvRot      | Maintainer recommendation for NVIDIA RTX 30-series systems. |
-| Q4_CR  | Experimental INT4 ConvRot | Experimental quantization targeting INT4                    |
+| Q4_CR_W4A4 | Per-row packed INT4, INT4 activations | Existing W4A4 format; `Q4_CR` remains its alias. |
+| Q4_CR_L | Per-row packed INT4, INT8 activations | Opt-in W4A8 execution using the same packed weight storage. |
+
+Select `Q4_CR_L` with `--quant-type Q4_CR_L` to use INT4 weights with INT8
+activations; this does not change the existing `Q4_CR` / `Q4_CR_W4A4` behavior.
+Both use `TensorCoreConvRotW4A4Layout` storage. The W4A8 CUDA route is provided
+by `comfy_kitchen`'s ConvRot kernel (`linear_dtype="int8"`), not by the separate
+Triton codebook W4A8 layout. When that CUDA route is unavailable, the loader
+uses dense dequantized PyTorch compute rather than mislabeling the eager W4A4
+fallback as W4A8. Standard runtime LoRAs retain the packed base and add a
+low-rank correction when supported; other patch types use the existing
+compute-dtype fused cache.
 
 K-quant creation uses the GGML-compatible deterministic encoder bundled with
 this converter and requires every selected row to be divisible by 256.

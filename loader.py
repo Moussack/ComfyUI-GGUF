@@ -12,7 +12,7 @@ from .ops import GGMLTensor
 from .dequant import is_quantized, dequantize_tensor
 from .quant_ops import make_quantized
 
-IMG_ARCH_LIST = {"flux", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "ltxv_upscaler", "hyvid", "wan", "lumina2", "qwen_image", "qwen_image21", "ideogram", "krea2", "minimax_h3", "minimax_h3_vae", "minimax_music3"}
+IMG_ARCH_LIST = {"flux", "flux3", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "ltxv_upscaler", "hyvid", "wan", "lumina2", "qwen_image", "qwen_image21", "ideogram", "krea2", "minimax_h3", "minimax_h3_vae", "minimax_music3"}
 TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "qwen35", "gemma3", "gemma4", "minimax_music3"}
 VIS_TYPE_LIST = {"clip-vision", "mmproj"}
 RAW_BYTE_TENSOR_KEYS = frozenset(("tokenizer_json", "spiece_model", "tekken_model"))
@@ -294,6 +294,24 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
             quant_conf.get("format") for quant_conf in custom_quant_configs.values()
         ),
     }
+    int4_backings = {
+        quant_conf.get("backing")
+        for quant_conf in custom_quant_configs.values()
+        if quant_conf.get("format") == "int4_cr"
+    }
+    if len(int4_backings) > 1:
+        raise ValueError(
+            f"GGUF mixes incompatible Q4_CR backings: {sorted(map(str, int4_backings))!r}"
+        )
+    if int4_backings == {"w4a4"}:
+        extra["gguf_quant_mode"] = "int4_cr_w4a4"
+    elif int4_backings == {"w4a8"}:
+        extra["gguf_quant_mode"] = "int4_cr_w4a8"
+    elif any(
+        quant_conf.get("format") == "int8_tensorwise"
+        for quant_conf in custom_quant_configs.values()
+    ):
+        extra["gguf_quant_mode"] = "int8_convrot"
 
     # Detect custom ComfyUI native quantization metadata
     warned_unrotated_convrot = False
@@ -361,17 +379,38 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
                 torch.tensor(list(quant_json.encode("utf-8")), dtype=torch.uint8),
                 requires_grad=False,
             )
-            extra["gguf_quant_mode"] = "int8_convrot"
 
-        # Q4_CR_W4A4: custom W4A4 INT4 backed by comfy_kitchen's fast ConvRot
-        # int4 tensor-core MMA. On-disk is kitchen-native packed int4 (N, K//2)
-        # int8 + a per-output-row fp16 scale; no per-group scales/zeros.
-        # The weight is pre-rotated by a block-diagonal Hadamard along K, matching
-        # the activation rotation the kernel applies at runtime.
-        elif fmt == "int4_cr" and quant_conf.get("backing") == "w4a4":
+        # Q4_CR_W4A4 and Q4_CR_L share packed ConvRot INT4 storage. The backing
+        # selects INT4 or INT8 activation execution; scales and packed bytes are
+        # unchanged between formats.
+        elif fmt == "int4_cr" and quant_conf.get("backing") in {"w4a4", "w4a8"}:
             orig_shape = torch.Size(tuple(quant_conf["orig_shape"]))
+            backing = quant_conf["backing"]
+            expected_linear_dtype = "int8" if backing == "w4a8" else "int4"
+            if backing == "w4a8" and "linear_dtype" not in quant_conf:
+                raise ValueError(f"Missing Q4_CR_L linear_dtype metadata for {weight_key}")
+            if quant_conf.get("linear_dtype", expected_linear_dtype) != expected_linear_dtype:
+                raise ValueError(
+                    f"Invalid Q4_CR linear_dtype for {weight_key}: backing {backing!r} "
+                    f"requires {expected_linear_dtype!r}."
+                )
+            if len(orig_shape) != 2 or orig_shape[0] <= 0 or orig_shape[1] <= 0 or orig_shape[1] % 2:
+                raise ValueError(f"Invalid Q4_CR original shape for {weight_key}: {tuple(orig_shape)!r}")
             convrot_groupsize = quant_conf.get("convrot_groupsize", 256)
             quant_group_size = quant_conf.get("quant_group_size", 64)
+            if (
+                not isinstance(convrot_groupsize, int)
+                or isinstance(convrot_groupsize, bool)
+                or convrot_groupsize <= 0
+                or not isinstance(quant_group_size, int)
+                or isinstance(quant_group_size, bool)
+                or orig_shape[1] % convrot_groupsize
+                or quant_group_size != 64
+            ):
+                raise ValueError(
+                    f"Invalid Q4_CR shape/group metadata for {weight_key}: shape={tuple(orig_shape)!r}, "
+                    f"convrot_groupsize={convrot_groupsize}, quant_group_size={quant_group_size}."
+                )
             packed_shape = (orig_shape[0], orig_shape[1] // 2)
 
             if dynamic:
@@ -389,13 +428,11 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
                 torch.tensor(list(json.dumps(quant_conf).encode("utf-8")), dtype=torch.uint8),
                 requires_grad=False,
             )
-            extra["gguf_quant_mode"] = "int4_cr_w4a4"
 
         elif fmt == "int4_cr":
-            # The retired W4A16 (AWQ GEMV) Q4_CR format is no longer supported.
             raise ValueError(
-                "This Q4_CR GGUF uses the retired W4A16 backing (no 'backing': 'w4a4'). "
-                "Reconvert with --quant-type Q4_CR_W4A4."
+                f"Unsupported Q4_CR backing for {weight_key}: {quant_conf.get('backing')!r}. "
+                "Reconvert with --quant-type Q4_CR_W4A4 or Q4_CR_L."
             )
 
     return (state_dict, extra)

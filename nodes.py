@@ -171,7 +171,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         weight = comfy.utils.get_attr(self.model, key)
 
         patches = self.patches[key]
-        # Legacy Q4_CR (INT4) path: the base weight stays packed (plain
+        # Legacy Q4_CR (INT4) paths: the base weight stays packed (plain
         # Parameter) and adapters run through the module's weight_function
         # (native low-rank bypass or fused fallback). Fusing directly with
         # calculate_weight here would corrupt the packed INT4 bytes.
@@ -188,7 +188,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                 out_weight = weight.to(device_to)
                 patches = move_patch_to_device(patches, self.load_device if self.patch_on_device else self.offload_device)
                 install_patch(patches, key)
-                logging.warning(f"Q4_CR type GGUF is best used with the f{UnetLoaderGGUFDynamicVRAM.TITLE} loader node, because using it with Legacy VRAM is much slower.")
+                logging.warning(f"Q4_CR INT4 GGUF is best used with the f{UnetLoaderGGUFDynamicVRAM.TITLE} loader node, because using it with Legacy VRAM is much slower.")
                 if inplace_update:
                     comfy.utils.copy_to_param(self.model, key, out_weight)
                 else:
@@ -513,8 +513,9 @@ class TargetedQuantizationGGUF:
                         "tooltip": (
                             "TARGET_SIZE starts at the selected Q8 type, reduces central core matrices "
                             "to Q5_0 then Q4_0, then ordinary 1-D tensors to BF16 only when necessary. "
-                            "Raw Q4_K/Q5_K/Q6_K selections are uniform; K types ending in _S or _M "
-                            "use deterministic mixed per-tensor precision."
+                            "Q4_CR_L uses INT4 weights with INT8 activations; Q4_CR and Q4_CR_W4A4 "
+                            "retain their existing W4A4 behavior. Raw Q4_K/Q5_K/Q6_K selections are "
+                            "uniform; K types ending in _S or _M use deterministic mixed per-tensor precision."
                         ),
                     },
                 ),
@@ -543,8 +544,8 @@ class TargetedQuantizationGGUF:
                     {
                         "default": "auto",
                         "tooltip": (
-                            "Q8_CR conversion device. auto uses CUDA when available and "
-                            "falls back to CPU per matrix when VRAM is insufficient."
+                            "Q8_CR / Q4_CR conversion device. auto uses CUDA when available "
+                            "and falls back to CPU per matrix when VRAM is insufficient."
                         ),
                     },
                 ),
@@ -857,6 +858,11 @@ def _legacy_gguf_ops(extra, compute_dtype=None):
         )
     if mode == "int4_cr_w4a4":
         return get_gguf_q4_w4a4_ops(compute_dtype=compute_dtype)()
+    if mode == "int4_cr_w4a8":
+        return get_gguf_q4_w4a4_ops(
+            compute_dtype=compute_dtype,
+            default_linear_dtype="int8",
+        )()
     return GGMLOps()
 
 

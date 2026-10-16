@@ -29,6 +29,7 @@ from tools.convert import (
     ModelMinimaxH3VAE,
     ModelMiniMaxMusic3DiT,
     ModelMiniMaxMusic3TextEncoder,
+    ModelFlux3,
     ModelQwen3,
     ModelQwen3VL,
     ModelQwenImage21,
@@ -102,9 +103,12 @@ def ops_module_factory():
     return module
 
 
-def ops_factory():
-    """Load the repo's ops.py and return its W4A4 operations class."""
-    return ops_module_factory().get_gguf_q4_w4a4_ops(torch.bfloat16)
+def ops_factory(default_linear_dtype="int4"):
+    """Load the repo's ops.py and return its ConvRot INT4 operations class."""
+    return ops_module_factory().get_gguf_q4_w4a4_ops(
+        torch.bfloat16,
+        default_linear_dtype=default_linear_dtype,
+    )
 
 
 def nodes_factory():
@@ -539,6 +543,7 @@ class Q8CRConversionDeviceTests(unittest.TestCase):
             "video_patch_proj.weight": torch.ones((32, 32), dtype=torch.float32),
             "audio_patch_proj.weight": torch.ones((32, 32), dtype=torch.float32),
             "blocks.0.attn.qkv_proj.weight": torch.ones((96, 32), dtype=torch.float32),
+            "blocks.0.mlp.fc1.weight": torch.ones((128, 512), dtype=torch.float32),
             "final_layer.video_out.weight": torch.ones((96, 32), dtype=torch.float32),
         }
 
@@ -564,10 +569,14 @@ class Q8CRConversionDeviceTests(unittest.TestCase):
 
         self.assertEqual(
             tensor_types["blocks.0.attn.qkv_proj.weight"],
+            gguf.GGMLQuantizationType.F32,
+        )
+        self.assertEqual(
+            tensor_types["blocks.0.mlp.fc1.weight"],
             gguf.GGMLQuantizationType.I8,
         )
         self.assertEqual(
-            tensor_types["blocks.0.attn.qkv_proj.weight_scale"],
+            tensor_types["blocks.0.mlp.fc1.weight_scale"],
             gguf.GGMLQuantizationType.F32,
         )
 
@@ -583,6 +592,96 @@ class Q8CRConversionDeviceTests(unittest.TestCase):
 
         self.assertEqual(state_dict["weight"].dtype, torch.float8_e4m3fn)
         self.assertEqual(source_keys["weight"], "weight")
+
+
+class Flux3ConversionTests(unittest.TestCase):
+    def _source_state_dict(self):
+        return {
+            "content_mode_blocks.image.0.attn_out.weight": torch.ones((32, 64), dtype=torch.bfloat16),
+            "content_mode_blocks.image_cond.0.attn_out.weight": torch.ones((32, 64), dtype=torch.bfloat16),
+            "single_stream_modulations.txt.lin.weight": torch.ones((96, 64), dtype=torch.bfloat16),
+            "content_mode_blocks.image.0.norm.query_norm.scale": torch.ones(4, dtype=torch.bfloat16),
+            "emb_in.image.weight": torch.ones((32, 128), dtype=torch.bfloat16),
+            "emb_in.image_cond.weight": torch.ones((32, 128), dtype=torch.bfloat16),
+        }
+
+    def test_detects_flux3_and_comfyui_runtime_config(self):
+        from comfy.model_detection import detect_unet_config
+
+        state_dict = self._source_state_dict()
+        self.assertIsInstance(detect_arch(state_dict), ModelFlux3)
+        self.assertEqual(detect_unet_config(state_dict, "")["image_model"], "flux3")
+
+    def test_k_quants_preserve_flux3_input_projections(self):
+        state_dict = {
+            "emb_in.image.weight": torch.ones((3072, 128), dtype=torch.bfloat16),
+            "emb_in.image_cond.weight": torch.ones((3072, 128), dtype=torch.bfloat16),
+        }
+        for quant_type in ("Q4_K_M", "Q6_K"):
+            plan = plan_k_quantization(state_dict, ModelFlux3(), quant_type)
+            with self.subTest(quant_type=quant_type):
+                self.assertEqual(
+                    plan["emb_in.image.weight"], gguf.GGMLQuantizationType.BF16
+                )
+                self.assertEqual(
+                    plan["emb_in.image_cond.weight"], gguf.GGMLQuantizationType.BF16
+                )
+
+    def test_q8_cr_conversion_loads_as_flux3_in_static_and_dynamic_modes(self):
+        state_dict = self._source_state_dict()
+        with TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "flux3.safetensors"
+            output_path = Path(temp_dir) / "flux3-Q8_CR.gguf"
+            save_file(state_dict, str(source_path))
+
+            converted_path, model_arch = convert_file(
+                str(source_path),
+                str(output_path),
+                interact=False,
+                quant_type_name="Q8_CR",
+                quantization_device="cpu",
+            )
+
+            reader = gguf.GGUFReader(converted_path)
+            tensor_types = {tensor.name: tensor.tensor_type for tensor in reader.tensors}
+            architecture = reader.get_field("general.architecture").contents()
+            reader.tensors.clear()
+            reader.fields.clear()
+            reader.data._mmap.close()
+            del reader
+
+            loader = load_gguf_loader()
+            loaded_architectures = []
+            for dynamic in (False, True):
+                loaded, extra = loader.gguf_sd_loader(
+                    converted_path,
+                    handle_prefix=None,
+                    dynamic=dynamic,
+                )
+                loaded_architectures.append(extra["arch_str"])
+                self.assertEqual(extra["gguf_quant_mode"], "int8_convrot")
+                self.assertEqual(
+                    tuple(loaded["content_mode_blocks.image.0.attn_out.weight"].shape),
+                    (32, 64),
+                )
+                del loaded
+                gc.collect()
+
+        self.assertIsInstance(model_arch, ModelFlux3)
+        self.assertEqual(architecture, "flux3")
+        self.assertEqual(loaded_architectures, ["flux3", "flux3"])
+        self.assertEqual(
+            tensor_types["content_mode_blocks.image.0.attn_out.weight"],
+            gguf.GGMLQuantizationType.I8,
+        )
+        self.assertEqual(
+            tensor_types["content_mode_blocks.image.0.attn_out.weight_scale"],
+            gguf.GGMLQuantizationType.F32,
+        )
+        self.assertEqual(
+            tensor_types["content_mode_blocks.image.0.norm.query_norm.scale"],
+            gguf.GGMLQuantizationType.F32,
+        )
 
 
 class QwenImage21ConversionTests(unittest.TestCase):
@@ -648,6 +747,148 @@ class QwenImage21ConversionTests(unittest.TestCase):
         self.assertEqual(tensor_types["transformer_blocks.0.attn.to_q.weight"], gguf.GGMLQuantizationType.I8)
         self.assertEqual(tensor_types["transformer_blocks.0.attn.to_q.weight_scale"], gguf.GGMLQuantizationType.F32)
         self.assertEqual(tensor_types["transformer_blocks.0.img_mlp.gate_up.weight"], gguf.GGMLQuantizationType.I8)
+
+    def test_q4_cr_l_serializes_w4a8_and_loads_mixed_q8_layers(self):
+        state_dict = {
+            "txt_in.text_norm.weight": torch.ones(16, dtype=torch.bfloat16),
+            "modulation.1.weight": torch.ones((64, 16), dtype=torch.bfloat16),
+            "transformer_blocks.0.attn.norm_q.weight": torch.ones(4, dtype=torch.bfloat16),
+            "transformer_blocks.0.attn.to_q.weight": torch.randn((64, 512), dtype=torch.bfloat16),
+            "transformer_blocks.0.mlp.fc1.weight": torch.randn((64, 512), dtype=torch.bfloat16),
+            "transformer_blocks.0.mlp.fc2.weight": torch.randn((64, 300), dtype=torch.bfloat16),
+            "img_in.weight": torch.ones((64, 128), dtype=torch.bfloat16),
+            "proj_out.weight": torch.ones((64, 512), dtype=torch.bfloat16),
+        }
+        with TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "qwen-image-2.1-Q4_CR_L.gguf"
+            converted_path, _ = convert_state_dict(
+                state_dict,
+                str(output_path),
+                quant_type_name="Q4_CR_L",
+                quantization_device="cpu",
+            )
+            reader = gguf.GGUFReader(converted_path)
+            tensor_types = {tensor.name: tensor.tensor_type for tensor in reader.tensors}
+            q4_conf_field = reader.get_field(
+                "comfy.gguf.quant.transformer_blocks.0.mlp.fc1.weight"
+            )
+            q4_conf = json.loads(str(q4_conf_field.parts[q4_conf_field.data[-1]], "utf-8"))
+            reader.tensors.clear()
+            reader.fields.clear()
+            reader.data._mmap.close()
+            del reader
+
+            loader = load_gguf_loader()
+            loaded, extra = loader.gguf_sd_loader(converted_path, dynamic=False)
+            nodes_module = nodes_factory()
+            ops_type = nodes_module._legacy_gguf_ops(extra)
+            q4_layer = ops_type.Linear(512, 64, bias=False)
+            q4_prefix = "transformer_blocks.0.mlp.fc1."
+            q4_layer._load_from_state_dict(
+                loaded,
+                prefix=q4_prefix,
+                local_metadata={},
+                strict=True,
+                missing_keys=[],
+                unexpected_keys=[],
+                error_msgs=[],
+            )
+            q8_layer = ops_type.Linear(512, 64, bias=False)
+            q8_prefix = "transformer_blocks.0.attn.to_q."
+            q8_layer._load_from_state_dict(
+                loaded,
+                prefix=q8_prefix,
+                local_metadata={},
+                strict=True,
+                missing_keys=[],
+                unexpected_keys=[],
+                error_msgs=[],
+            )
+            x = torch.randn((3, 512), dtype=torch.float32)
+            self.assertEqual(q4_layer._linear_dtype_for_input(x), "int8")
+            qt = q4_layer._get_cached_quantized_weight(torch.device("cpu"))
+            self.assertEqual(qt._params.linear_dtype, "int8")
+            q4_layer.evict_quantized_caches()
+            base_out = q4_layer(x)
+            dense_reference = torch.nn.functional.linear(
+                x, q4_layer._dequantized_weight(torch.device("cpu"), x.dtype)
+            )
+            torch.testing.assert_close(base_out, dense_reference, atol=1e-4, rtol=1e-3)
+            from comfy.weight_adapter import LoRAAdapter
+            rank = 4
+            up = torch.randn((64, rank), dtype=torch.float32)
+            down = torch.randn((rank, 512), dtype=torch.float32)
+            adapter = LoRAAdapter(set(), (up, down, float(rank), None, None, None))
+            key = "transformer_blocks.0.mlp.fc1.weight"
+            patches = {key: [(0.5, adapter, 1.0, None, None)]}
+
+            class FakeLowVramPatch:
+                is_lowvram_patch = True
+                def __init__(self, key, patches):
+                    self.key = key
+                    self.patches = patches
+                    self.prepared_patches = None
+                def __call__(self, value):
+                    return value
+
+            q4_layer.weight_function = [FakeLowVramPatch(key, patches)]
+            native_out = q4_layer(x)
+            expected = base_out + 0.5 * torch.nn.functional.linear(
+                torch.nn.functional.linear(x, down), up
+            )
+            torch.testing.assert_close(native_out, expected, atol=1e-4, rtol=1e-3)
+            self.assertIsNone(q4_layer._fused_weight)
+
+            q4_layer.weight_function = [lambda value, *args, **kwargs: value + 0.125]
+            fused_out = q4_layer(x)
+            self.assertIsNotNone(q4_layer._fused_weight)
+            self.assertIsNone(q4_layer._quantized_weight)
+            torch.testing.assert_close(
+                fused_out,
+                torch.nn.functional.linear(
+                    x, q4_layer._fused_weight.to(dtype=x.dtype)
+                ),
+                atol=1e-4,
+                rtol=1e-3,
+            )
+            dynamic_sd, dynamic_extra = loader.gguf_sd_loader(
+                converted_path, dynamic=True
+            )
+            self.assertEqual(dynamic_extra["gguf_quant_mode"], "int4_cr_w4a8")
+            self.assertIn("transformer_blocks.0.mlp.fc1.comfy_quant", dynamic_sd)
+            del dynamic_sd, dynamic_extra
+            q4_default_dtype = q4_layer._default_linear_dtype
+            q4_is_quantized = q4_layer._quantized
+            q8_is_quantized = q8_layer._quantized
+            del qt, q4_layer, q8_layer, loaded
+            gc.collect()
+
+        self.assertEqual(q4_conf["backing"], "w4a8")
+        self.assertEqual(q4_conf["linear_dtype"], "int8")
+        self.assertEqual(extra["gguf_quant_mode"], "int4_cr_w4a8")
+        self.assertEqual(q4_default_dtype, "int8")
+        self.assertTrue(q4_is_quantized)
+        self.assertFalse(q8_is_quantized)
+        self.assertEqual(
+            tensor_types["transformer_blocks.0.attn.to_q.weight"],
+            gguf.GGMLQuantizationType.I8,
+        )
+        self.assertEqual(
+            tensor_types["transformer_blocks.0.mlp.fc1.weight"],
+            gguf.GGMLQuantizationType.I8,
+        )
+        self.assertEqual(
+            tensor_types["transformer_blocks.0.mlp.fc2.weight"],
+            gguf.GGMLQuantizationType.F16,
+        )
+        self.assertEqual(
+            tensor_types["transformer_blocks.0.attn.to_q.weight_scale"],
+            gguf.GGMLQuantizationType.F32,
+        )
+        self.assertEqual(
+            tensor_types["img_in.weight"],
+            gguf.GGMLQuantizationType.BF16,
+        )
 
 
 class QwenImage21InferenceFallbackTests(unittest.TestCase):
@@ -2693,6 +2934,8 @@ class MinimaxH3DetectionTests(unittest.TestCase):
 
     def test_q4_preserves_sensitive_transformer_components(self):
         state_dict = {
+            "video_patch_proj.weight": torch.ones((32, 32), dtype=torch.float32),
+            "audio_patch_proj.weight": torch.ones((32, 32), dtype=torch.float32),
             "blocks.0.attn.qkv_proj.weight": torch.ones((512, 512), dtype=torch.float16),
             "blocks.0.adaln_proj.linear.weight": torch.ones((512, 8), dtype=torch.float16),
             "blocks.0.attn.norm1.weight": torch.ones((512,), dtype=torch.bfloat16),
@@ -2732,7 +2975,7 @@ class MinimaxH3DetectionTests(unittest.TestCase):
         )
         self.assertEqual(
             tensor_types["blocks.0.attn.norm1.weight"],
-            gguf.GGMLQuantizationType.BF16,
+            gguf.GGMLQuantizationType.F32,
         )
         self.assertEqual(
             tensor_types["blocks.0.modulation.weight"],
@@ -2828,7 +3071,7 @@ class MinimaxH3DetectionTests(unittest.TestCase):
         self.assertEqual(architecture_name, "minimax_h3")
         self.assertEqual(
             tensor_types["blocks.0.attn.qkv_proj.weight"],
-            gguf.GGMLQuantizationType.Q8_0,
+            gguf.GGMLQuantizationType.F32,
         )
         self.assertEqual(
             tensor_types["adaln_t_table"],
@@ -2855,6 +3098,85 @@ class Q4CRW4A4QuantizationTests(unittest.TestCase):
         self.assertEqual(quant_conf["convrot_groupsize"], 256)
         self.assertEqual(quant_conf["quant_group_size"], 64)
         self.assertTrue(quant_conf["sym"])
+
+    def test_q4_cr_l_is_exposed_in_converter_node_quantization_choices(self):
+        node_module = nodes_factory()
+        choices = node_module.TargetedQuantizationGGUF.INPUT_TYPES()["required"]["quantization"][0]
+        self.assertIn("Q4_CR_L", choices)
+        self.assertIn("Q4_CR_W4A4", choices)
+        self.assertIn("Q4_CR", choices)
+        self.assertIs(
+            node_module.NODE_CLASS_MAPPINGS["TargetedQuantizationGGUF"],
+            node_module.TargetedQuantizationGGUF,
+        )
+
+    def test_q4_cr_l_is_exposed_and_forwarded_by_conversion_webui(self):
+        from tools import conversion_webui
+
+        page = conversion_webui.PAGE.read_text(encoding="utf-8")
+        self.assertIn('<option value="Q4_CR_L">', page)
+
+        with TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "model.safetensors"
+            destination = Path(temp_dir) / "model-Q4_CR_L.gguf"
+            source.touch()
+            with mock.patch.object(conversion_webui.threading, "Thread"):
+                manager = conversion_webui.ConversionManager()
+                job = manager.create(
+                    {
+                        "source": str(source),
+                        "destination": str(destination),
+                        "quant_type": "Q4_CR_L",
+                    }
+                )
+
+        self.assertEqual(job["quant_type"], "Q4_CR_L")
+        self.assertEqual(
+            manager.jobs[job["id"]]["command"][-2:],
+            ["--quant-type", "Q4_CR_L"],
+        )
+
+    def test_int4_cr_w4a8_reuses_packed_layout_and_marks_int8_activations(self):
+        torch.manual_seed(1)
+        weight = torch.randn(64, 512, dtype=torch.float32)
+        packed, wscales, quant_conf, orig_shape = quantize_int4_cr_w4a4(
+            weight,
+            convrot_groupsize=256,
+            quant_group_size=64,
+            device=torch.device("cpu"),
+            backing="w4a8",
+        )
+
+        self.assertEqual(packed.shape, (64, 256))
+        self.assertEqual(packed.dtype, torch.int8)
+        self.assertEqual(wscales.shape, (64,))
+        self.assertEqual(wscales.dtype, torch.float32)
+        self.assertEqual(orig_shape, (64, 512))
+        self.assertEqual(quant_conf["format"], "int4_cr")
+        self.assertEqual(quant_conf["backing"], "w4a8")
+        self.assertEqual(quant_conf["linear_dtype"], "int8")
+
+    def test_int4_cr_w4a8_rejects_missing_linear_dtype_metadata(self):
+        packed, wscales, quant_conf, _ = quantize_int4_cr_w4a4(
+            torch.randn(64, 512), backing="w4a8", device=torch.device("cpu")
+        )
+        quant_conf.pop("linear_dtype")
+        ops = ops_factory(default_linear_dtype="int8")
+        lin = ops.Linear(512, 64, bias=False)
+        with self.assertRaisesRegex(ValueError, "Missing Q4_CR_L linear_dtype"):
+            lin._load_from_state_dict(
+                {
+                    "weight": packed,
+                    "weight_scale": wscales.half(),
+                    "comfy_quant": torch.tensor(list(json.dumps(quant_conf).encode("utf-8"))),
+                },
+                prefix="",
+                local_metadata={},
+                strict=True,
+                missing_keys=[],
+                unexpected_keys=[],
+                error_msgs=[],
+            )
 
     def test_int4_cr_w4a4_roundtrips_through_dequant(self):
         torch.manual_seed(0)
@@ -2900,6 +3222,7 @@ class Q4CRW4A4QuantizationTests(unittest.TestCase):
         state_dict = {
             "video_patch_proj.weight": torch.ones((32, 32), dtype=torch.float32),
             "audio_patch_proj.weight": torch.ones((32, 32), dtype=torch.float32),
+            "blocks.0.attn.qkv_proj.weight": torch.ones((96, 512), dtype=torch.float32),
             "blocks.0.mlp.fc1.weight": torch.ones((128, 512), dtype=torch.float32),
             "final_layer.video_out.weight": torch.ones((96, 512), dtype=torch.float32),
         }
@@ -2934,6 +3257,7 @@ class Q4CRW4A4QuantizationTests(unittest.TestCase):
         state_dict = {
             "video_patch_proj.weight": torch.randn(32, 32, dtype=torch.float32),
             "audio_patch_proj.weight": torch.randn(32, 32, dtype=torch.float32),
+            "blocks.0.attn.qkv_proj.weight": torch.randn(96, 512, dtype=torch.float32),
             "blocks.0.mlp.fc1.weight": torch.randn(128, 512, dtype=torch.float32),
             "final_layer.video_out.weight": torch.randn(96, 512, dtype=torch.float32),
         }
