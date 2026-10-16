@@ -248,10 +248,9 @@ def _perf_forward(mode, layer, input_tensor, operation):
 
 def _build_regular_hadamard(size, dtype=torch.float32, device="cpu"):
     """Build a normalized regular (Sylvester) Hadamard of a power-of-4 size."""
-    if size < 4 or (size & (size - 1)) != 0:
-        import math
-        if not math.log(size, 4).is_integer():
-            raise ValueError(f"Regular Hadamard size must be a power of 4, got {size}")
+    import math
+    if size < 4 or (size & (size - 1)) != 0 or not math.log(size, 4).is_integer():
+        raise ValueError(f"Regular Hadamard size must be a power of 4, got {size}")
     h4 = torch.tensor(
         [[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]],
         dtype=dtype,
@@ -718,16 +717,18 @@ def get_gguf_q8_ops(compute_dtype=torch.bfloat16, full_precision_mm=False):
     return GGUFQ8Ops
 
 
-# Q4_CR_W4A4: custom W4A4 INT4 format backed by comfy_kitchen's fast ConvRot
-# int4 tensor-core MMA. On-disk is kitchen-native packed int4 (N, K//2) int8
-# + a per-output-row fp16 scale. The weight is pre-rotated by a block-diagonal
-# Hadamard along K; at runtime the kernel rotates the activation into the same
-# basis, so output is directly in the original space.
+# Q4_CR_W4A4 / Q4_CR_L share comfy_kitchen's ConvRot packed INT4 layout.
+# Q4_CR_L selects INT8 activations through the layout's linear_dtype parameter.
 def get_gguf_q4_w4a4_ops(
     compute_dtype=torch.bfloat16,
     full_precision_mm=False,
     batch1_gemv=False,
+    default_linear_dtype="int4",
 ):
+    if default_linear_dtype not in {"int4", "int8"}:
+        raise ValueError(
+            f"Q4_CR ConvRot linear dtype must be 'int4' or 'int8', got {default_linear_dtype!r}"
+        )
     try:
         from comfy_kitchen.tensor.convrot_w4a4 import (
             TensorCoreConvRotW4A4Layout,
@@ -740,6 +741,17 @@ def get_gguf_q4_w4a4_ops(
         quantize_convrot_w4a4_weight = None
         QuantizedTensor = None
         _HAVE_KITCHEN = False
+
+    w4a8_fallback_warned = False
+
+    def warn_w4a8_dense_fallback():
+        nonlocal w4a8_fallback_warned
+        if not w4a8_fallback_warned:
+            logging.warning(
+                "Q4_CR_L has no compatible comfy_kitchen CUDA W4A8 backend for this execution path; "
+                "using dense dequantized PyTorch fallback (CUDA inputs may run on CPU)."
+            )
+            w4a8_fallback_warned = True
 
     class GGUFQ4W4A4Ops(comfy.ops.disable_weight_init):
         class Linear(torch.nn.Module, comfy.ops.CastWeightBiasOp):
@@ -761,6 +773,7 @@ def get_gguf_q4_w4a4_ops(
                 self._quantized_weight_device = None
                 self._quantized_weight_linear_dtype = None
                 self._batch1_gemv = batch1_gemv
+                self._default_linear_dtype = default_linear_dtype
                 # Cache for a dequantized non-native patch. Re-quantizing a small
                 # delta to INT4 can round it away; compatible LoRA/LoKr instead use
                 # the packed base plus their low-rank output correction.
@@ -818,7 +831,7 @@ def get_gguf_q4_w4a4_ops(
                     return
 
                 if scale is None:
-                    raise RuntimeError(f"Missing Q4_CR_W4A4 scale tensor for {prefix}")
+                    raise RuntimeError(f"Missing Q4_CR scale tensor for {prefix}")
 
                 quant_conf = json.loads(bytes(quant_raw.tolist()).decode("utf-8"))
                 if quant_conf.get("format") == "int8_tensorwise":
@@ -826,24 +839,69 @@ def get_gguf_q4_w4a4_ops(
                     # This Q4 operator cannot dispatch TensorWiseINT8 directly,
                     # so materialize those layers safely instead of rejecting the
                     # whole model. A native mixed backend can replace this fallback.
-                    if weight.ndim != 2 or scale.ndim != 1 or scale.shape[0] != weight.shape[0]:
+                    if weight.ndim != 2 or scale.numel() != weight.shape[0]:
                         raise ValueError(f"Invalid mixed INT8 tensors for {prefix}")
+                    materialize_dtype = self._compute_dtype or dtype or torch.bfloat16
+                    w_float = weight.to(dtype=torch.float32) * scale.to(
+                        device=weight.device, dtype=torch.float32
+                    ).reshape(weight.shape[0], 1)
+                    if quant_conf.get("convrot", False) and quant_conf.get("weight_rotated", True):
+                        groupsize = int(quant_conf.get("convrot_groupsize", 256))
+                        if w_float.shape[1] % groupsize != 0:
+                            raise ValueError(
+                                f"Invalid ConvRot groupsize {groupsize} for {prefix} shape {tuple(w_float.shape)}"
+                            )
+                        had = _build_regular_hadamard(
+                            groupsize, dtype=torch.float32, device=w_float.device
+                        )
+                        w_float = torch.matmul(
+                            w_float.reshape(w_float.shape[0], -1, groupsize),
+                            had,
+                        ).reshape(w_float.shape)
                     self.weight = torch.nn.Parameter(
-                        weight.to(dtype=self.factory_kwargs["dtype"]) * scale.to(
-                            device=weight.device, dtype=self.factory_kwargs["dtype"]
-                        ).unsqueeze(1),
+                        w_float.to(dtype=materialize_dtype),
                         requires_grad=False,
                     )
                     self._quantized = False
                     return
-                if quant_conf.get("format") != "int4_cr" or quant_conf.get("backing") != "w4a4":
+                backing = quant_conf.get("backing")
+                if quant_conf.get("format") != "int4_cr" or backing not in {"w4a4", "w4a8"}:
                     raise ValueError(
-                        f"Unsupported Q4_CR_W4A4 format for {prefix}: {quant_conf.get('format')!r} "
-                        f"/ {quant_conf.get('backing')!r}"
+                        f"Unsupported Q4_CR format for {prefix}: {quant_conf.get('format')!r} "
+                        f"/ {backing!r}"
                     )
+                expected_linear_dtype = "int8" if backing == "w4a8" else "int4"
+                if backing == "w4a8" and "linear_dtype" not in quant_conf:
+                    raise ValueError(f"Missing Q4_CR_L linear_dtype metadata for {prefix}")
+                linear_dtype = quant_conf.get("linear_dtype", expected_linear_dtype)
+                if linear_dtype != expected_linear_dtype:
+                    raise ValueError(
+                        f"Invalid Q4_CR linear_dtype for {prefix}: backing {backing!r} "
+                        f"requires {expected_linear_dtype!r}, got {linear_dtype!r}"
+                    )
+                self._default_linear_dtype = linear_dtype
                 self._convrot_groupsize = quant_conf.get("convrot_groupsize", 256)
                 self._quant_group_size = quant_conf.get("quant_group_size", 64)
                 self._orig_shape = tuple(quant_conf.get("orig_shape", (self.out_features, self.in_features)))
+                if (
+                    len(self._orig_shape) != 2
+                    or self._orig_shape[0] <= 0
+                    or self._orig_shape[1] <= 0
+                    or self._orig_shape[1] % 2
+                    or not isinstance(self._convrot_groupsize, int)
+                    or isinstance(self._convrot_groupsize, bool)
+                    or self._convrot_groupsize <= 0
+                    or self._orig_shape[1] % self._convrot_groupsize
+                    or self._quant_group_size != 64
+                ):
+                    raise ValueError(f"Invalid Q4_CR shape/group metadata for {prefix}")
+                if (
+                    weight.ndim != 2
+                    or tuple(weight.shape) != (self._orig_shape[0], self._orig_shape[1] // 2)
+                    or scale.ndim != 1
+                    or scale.shape[0] != self._orig_shape[0]
+                ):
+                    raise ValueError(f"Invalid Q4_CR packed tensors for {prefix}")
                 self.out_features = self._orig_shape[0]
                 self.in_features = self._orig_shape[1]
 
@@ -905,7 +963,9 @@ def get_gguf_q4_w4a4_ops(
                 )
                 return QuantizedTensor(packed, "TensorCoreConvRotW4A4Layout", params)
 
-            def _get_cached_quantized_weight(self, device, packed=None, linear_dtype="int4"):
+            def _get_cached_quantized_weight(self, device, packed=None, linear_dtype=None):
+                if linear_dtype is None:
+                    linear_dtype = self._default_linear_dtype
                 if packed is not None:
                     # A patched/offloaded packed weight may differ from self.weight
                     # (e.g. moved to device each forward). Build fresh; don't cache,
@@ -932,7 +992,31 @@ def get_gguf_q4_w4a4_ops(
                 self._quantized_weight_linear_dtype = linear_dtype
                 return qt
 
+            def _has_native_w4a8_cuda_backend(self, input_tensor, quantized_weight):
+                if input_tensor.device.type != "cuda" or quantized_weight is None:
+                    return False
+                try:
+                    from comfy_kitchen.registry import registry
+
+                    params = quantized_weight._params
+                    return registry.get_capable_backend(
+                        "convrot_w4a4_linear",
+                        {
+                            "x": input_tensor,
+                            "qweight": quantized_weight._qdata,
+                            "wscales": params.scale,
+                            "bias": None,
+                            "convrot_groupsize": params.convrot_groupsize,
+                            "quant_group_size": params.quant_group_size,
+                            "linear_dtype": "int8",
+                        },
+                    ) == "cuda"
+                except Exception:
+                    return False
+
             def _linear_dtype_for_input(self, input_tensor):
+                if self._default_linear_dtype == "int8":
+                    return "int8"
                 if (
                     self._batch1_gemv
                     and input_tensor.device.type == "cuda"
@@ -1048,7 +1132,7 @@ def get_gguf_q4_w4a4_ops(
                                 raise
                             self._move_derived_caches_to_cpu()
                             logging.warning(
-                                "Q4_CR_W4A4 CUDA fallback for INT4 adapter layer: "
+                                "Q4_CR CUDA fallback for INT4 adapter layer: "
                                 "CUDA ran out of memory while preparing the patched weight."
                             )
                             fused = self._get_cached_fused_weight(torch.device("cpu")) is not None
@@ -1264,8 +1348,33 @@ def get_gguf_q4_w4a4_ops(
                             bias = f(bias)
                 if not self._quantized or self.weight is None:
                     # Plain Linear path
-                    weight = self.weight.to(device=input.device, dtype=input.dtype)
+                    weight = (
+                        self.weight.to(device=input.device, dtype=input.dtype)
+                        if self.weight is not None else None
+                    )
+                    if weight is not None:
+                        for f in getattr(self, "weight_function", ()):
+                            weight = f(weight)
                     return torch.nn.functional.linear(input, weight, bias)
+                if self._default_linear_dtype == "int8" and input.device.type != "cuda":
+                    warn_w4a8_dense_fallback()
+                    # The eager ConvRot W4A4 implementation accepts the int8
+                    # selector but quantizes activations to INT4. Use dense
+                    # dequantization rather than silently executing as W4A4.
+                    native_entries = self._native_lora_patch_entries() if has_weight_functions else None
+                    if native_entries:
+                        weight = self._dequantized_weight(input.device, input.dtype)
+                        out = torch.nn.functional.linear(input, weight, bias)
+                        bypass_out = self._native_lora_bypass(input, out)
+                        if bypass_out is not None:
+                            return bypass_out
+                    if has_weight_functions:
+                        weight = self._get_cached_fused_weight(torch.device(input.device))
+                    else:
+                        weight = self._dequantized_weight(input.device, input.dtype)
+                    return torch.nn.functional.linear(
+                        input, weight.to(device=input.device, dtype=input.dtype), bias
+                    )
                 if has_weight_functions or has_bias_functions:
                     # Compatible LoRA/LoKr uses the native base plus a low-rank output
                     # correction. Other patch forms use a cached un-rotated BF16
@@ -1291,9 +1400,19 @@ def get_gguf_q4_w4a4_ops(
                             if input.device.type != "cuda":
                                 raise
                             logging.warning(
-                                "Q4_CR_W4A4 CUDA fallback for INT4 adapter layer: "
+                                "Q4_CR CUDA fallback for INT4 adapter layer: "
                                 "CUDA ran out of memory; retrying this layer in system memory."
                             )
+                            return self._cpu_forward_fallback(
+                                input,
+                                bias,
+                                native_entries=native_entries,
+                                use_fused_weight=not bool(native_entries),
+                            )
+                        if self._default_linear_dtype == "int8" and not self._has_native_w4a8_cuda_backend(
+                            input, weight_qt
+                        ):
+                            warn_w4a8_dense_fallback()
                             return self._cpu_forward_fallback(
                                 input,
                                 bias,
@@ -1315,7 +1434,7 @@ def get_gguf_q4_w4a4_ops(
                                 del base_out
                                 del weight_qt
                                 logging.warning(
-                                    "Q4_CR_W4A4 CUDA fallback for INT4 adapter layer: "
+                                    "Q4_CR CUDA fallback for INT4 adapter layer: "
                                     "CUDA ran out of memory; retrying this layer in system memory."
                                 )
                                 return self._cpu_forward_fallback(
@@ -1327,7 +1446,7 @@ def get_gguf_q4_w4a4_ops(
                             if input.device.type != "cuda":
                                 raise
                             logging.warning(
-                                "Q4_CR_W4A4 CUDA fallback for INT4 adapter layer: "
+                                "Q4_CR CUDA fallback for INT4 adapter layer: "
                                 "CUDA ran out of memory; retrying this layer in system memory."
                             )
                             return self._cpu_forward_fallback(input, bias, use_fused_weight=True)
@@ -1346,7 +1465,7 @@ def get_gguf_q4_w4a4_ops(
                                 raise
                             del fused_weight
                             logging.warning(
-                                "Q4_CR_W4A4 CUDA fallback for INT4 adapter layer: "
+                                "Q4_CR CUDA fallback for INT4 adapter layer: "
                                 "CUDA ran out of memory; retrying this layer in system memory."
                             )
                             return self._cpu_forward_fallback(input, bias, use_fused_weight=True)
@@ -1357,9 +1476,16 @@ def get_gguf_q4_w4a4_ops(
                         linear_dtype=self._linear_dtype_for_input(input),
                     )
                     if weight_qt is None:
+                        if self._default_linear_dtype == "int8":
+                            warn_w4a8_dense_fallback()
                         # No comfy_kitchen / non-CUDA: dequant fallback.
                         _orig_w = self._dequantized_weight(input.device, input.dtype)
                         return torch.nn.functional.linear(input, _orig_w, bias)
+                    if self._default_linear_dtype == "int8" and not self._has_native_w4a8_cuda_backend(
+                        input, weight_qt
+                    ):
+                        warn_w4a8_dense_fallback()
+                        return self._cpu_forward_fallback(input, bias)
 
                     out = torch.nn.functional.linear(input, weight_qt)
                     if bias is not None:
@@ -1369,7 +1495,7 @@ def get_gguf_q4_w4a4_ops(
                     if input.device.type != "cuda":
                         raise
                     logging.warning(
-                        "Q4_CR_W4A4 CUDA fallback for INT4 layer: "
+                        "Q4_CR CUDA fallback for INT4 layer: "
                         "CUDA ran out of memory; retrying this layer in system memory."
                     )
                     return self._cpu_forward_fallback(input, bias)
@@ -1387,7 +1513,12 @@ def get_gguf_q4_w4a4_ops(
                         bias=self.bias,
                     )
 
-                return _perf_forward("int4_convrot_w4a4", self, input_tensor, run_forward)
+                perf_mode = (
+                    "int4_convrot_w4a8"
+                    if self._default_linear_dtype == "int8"
+                    else "int4_convrot_w4a4"
+                )
+                return _perf_forward(perf_mode, self, input_tensor, run_forward)
 
             def _dequantized_weight(self, device, dtype):
                 packed = self.weight.to(device=device).to(torch.int8)

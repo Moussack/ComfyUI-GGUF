@@ -32,6 +32,33 @@ For Krea 2 and Ideogram 4 models on RTX 30-series architecture, `Q8_CR` offers s
 * High image fidelity expected from 8-bit quantization while shielding sensitive tensors.
 * Reduced VRAM pressure during complex multi-model spatial workflows.
 
+## ConvRot INT4 Formats (Q4_CR_W4A4 and Q4_CR_L)
+
+Both INT4 formats store the same kitchen-native ConvRot payload: packed signed
+INT4 weights shaped `[N, K // 2]` in `I8` GGUF storage, one `F16` scale per
+output row, and `int4_cr` metadata with `convrot_groupsize=256` and
+`quant_group_size=64`. The metadata backing distinguishes the execution mode:
+`w4a4` for `Q4_CR_W4A4`, or `w4a8` plus `linear_dtype="int8"` for `Q4_CR_L`.
+`Q4_CR` remains an alias for `Q4_CR_W4A4`; the W4A8 variant is an explicit
+converter selection and does not change the default.
+
+`Q4_CR_L` builds the same `TensorCoreConvRotW4A4Layout` with
+`linear_dtype="int8"`. On the supported CUDA backend this quantizes rotated
+activations row-wise to INT8 and executes INT4-weight × INT8-activation GEMV
+for small row counts or chunked INT8 GEMM for larger batches. This is a
+`comfy_kitchen` CUDA route; there is no ComfyUI-GGUF Triton kernel for this
+row-wise layout. The separate grouped-codebook `AsymW4A8Int8Layout` Triton
+kernel uses different weight storage and is not used by `Q4_CR_L`. The
+`comfy_kitchen` eager ConvRot implementation currently quantizes activations to
+INT4 even when given the `int8` selector, so non-CUDA execution deliberately
+uses dense dequantized PyTorch weights instead of silently running W4A4.
+
+The custom GGUF loader validates the backing/linear-dtype metadata and selects
+a corresponding operator mode. Mixed `Q8_CR` layers in a Q4 file are
+materialized safely by the Q4 operator, and loader mode selection prioritizes
+the Q4 backing when both custom formats are present. Unsupported or malformed
+backings are rejected rather than interpreted as another format.
+
 ## Experimental Accelerated GGML K-Quant Linear
 
 Standard `Q3_K`, `Q4_K`, `Q5_K`, and `Q6_K` tensors retain their packed GGUF
@@ -91,9 +118,13 @@ The fallback logic operates as follows:
 
 Imported GGUF LoRAs retain normal dynamic-patch behavior to ensure maximum compatibility. Because of this, an active LoRA prevents `Q8_CR` Linear layers from utilizing their native INT8 fast path. 
 
-For `Q4_CR_W4A4`, compatible standard LoRA and LoKr patches keep the packed
-INT4 base and add an exact BF16 low-rank output correction on every platform.
-They do not fuse or cache a full patched weight.
+For `Q4_CR_W4A4` and `Q4_CR_L`, compatible standard LoRA and LoKr patches keep
+the packed INT4 base and add a low-rank output correction in the active compute
+dtype. They do not fuse or cache a full patched weight. The static model patcher
+installs patch functions on the quantized Linear rather than applying
+`calculate_weight()` to packed nibble bytes; the Dynamic VRAM patcher promotes
+its `LowVramPatch`, prepares eligible adapter factors, and uses the same native
+bypass. This preserves LoRA execution without corrupting packed weights.
 
 Other patch forms that cannot use either compatible LoRA/LoKr route fall back to a compute-dtype cache:
 1. It dequantizes the target and applies the patch in the compute dtype.

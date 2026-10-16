@@ -85,7 +85,9 @@ class ModelTemplate:
     keys_banned = []  # list of keys that should mark model as invalid for conversion
     keys_hiprec = []  # list of keys that need to be kept in fp32 for some reason
     keys_noquant = [] # list of keys that must retain their source precision
+    keys_k_noquant = [] # tensors to keep at source precision for standard K-quants
     keys_q8_cr = [] # keys that use native INT8 ConvRot in a Q4_CR conversion
+    keys_q8_cr_l = [] # additional keys that use native INT8 ConvRot in a Q4_CR_L conversion
     keys_ignore = []  # list of strings to ignore keys by when found
 
     def handle_nd_tensor(self, key, data):
@@ -127,6 +129,38 @@ class ModelFlux(ModelTemplate):
         ("double_blocks.0.img_attn.proj.weight",),
     ]
     keys_banned = ["transformer_blocks.0.attn.norm_added_k.weight",]
+
+class ModelFlux3(ModelTemplate):
+    arch = "flux3"
+    keys_detect = [
+        (
+            "content_mode_blocks.image.0.attn_out.weight",
+            "content_mode_blocks.image_cond.0.attn_out.weight",
+            "single_stream_modulations.txt.lin.weight",
+        )
+    ]
+    # Keep final latent patch projection in F32 to avoid per-patch quantization grid artifacts.
+    keys_hiprec = ["^final_layer.image.linear."]
+    # Input patch projections have K=128 (below 256-value block size); retain source precision.
+    keys_noquant = ["^emb_in."]
+    keys_k_noquant = ["^emb_in."]
+    # Conditioning, shared AdaLN modulations, and early image attention output
+    # projections are highly sensitive to 4-bit error.
+    keys_q8_cr = [
+        "^time_in.",
+        "^ref_time_in.",
+        "^txt_in.",
+        "^final_layer.image.adaLN_modulation.",
+        "^early_stream_modulations.",
+        "^single_stream_modulations.",
+        "^content_mode_blocks.image.*.attn_out.*",
+    ]
+    # Q4_CR_L additionally promotes early dual-stream image V and text attention
+    # output projections to Q8_CR while keeping Flux3 Klein under 3 GB.
+    keys_q8_cr_l = [
+        "^content_mode_blocks.image.*.v_proj.*",
+        "^txt_mode_blocks.*.attn_out.*",
+    ]
 
 class ModelSD3(ModelTemplate):
     arch = "sd3"
@@ -347,9 +381,9 @@ class ModelMinimaxH3(ModelTemplate):
         "^final_layer.",
         "adaln_proj",
         "modulation",
-        "^blocks.*.attn.qkv_proj.",
-        "^blocks.*.attn.out_proj.",
-        "^blocks.*.mlp.fc2.",
+        "^blocks.*.attn.qkv_proj.*",
+        "^blocks.*.attn.out_proj.*",
+        "^blocks.*.mlp.fc2.*",
     ]
     # These paths are already BF16 in the reference checkpoint. Quantizing the
     # conditioning projection or token refiner to W4A4 costs quality while
@@ -488,7 +522,7 @@ class ModelQwenImage21(ModelTemplate):
     ]
 
 
-arch_list = [ModelFlux, ModelSD3, ModelAura, ModelHiDream, CosmosPredict2,
+arch_list = [ModelFlux, ModelFlux3, ModelSD3, ModelAura, ModelHiDream, CosmosPredict2,
              ModelLTXV, ModelLTXVUpsampler, ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2,
              ModelKrea2, ModelIdeogram, ModelMinimaxH3, ModelMinimaxH3VAE,
              ModelMiniMaxMusic3DiT, ModelMiniMaxMusic3TextEncoder, ModelQwen3, ModelQwen3VL,
@@ -701,7 +735,7 @@ def validate_key_patterns(model_arch, state_dict):
     variant that simply doesn't include that sub-module (see ModelKrea2's
     two keys_detect alternatives, which exist for exactly this reason).
     """
-    for attr in ("keys_hiprec", "keys_noquant", "keys_q8_cr", "keys_ignore"):
+    for attr in ("keys_hiprec", "keys_noquant", "keys_k_noquant", "keys_q8_cr", "keys_q8_cr_l", "keys_ignore"):
         for pattern in getattr(model_arch, attr, []):
             if not any(key_matches(key, [pattern]) for key in state_dict.keys()):
                 logging.warning(
@@ -732,10 +766,10 @@ QUANT_TYPE_MAP = {
     "Q5_K_S": (gguf.GGMLQuantizationType.Q5_K, gguf.LlamaFileType.MOSTLY_Q5_K_S),
     "Q5_K_M": (gguf.GGMLQuantizationType.Q5_K, gguf.LlamaFileType.MOSTLY_Q5_K_M),
     "Q8_CR": (gguf.GGMLQuantizationType.I8, None),  # INT8 ConvRot (ComfyUI native)
-    # Q4_CR_W4A4 is a custom W4A4 INT4 format backed by comfy_kitchen's fast
-    # ConvRot int4 tensor-core MMA. Stored as kitchen-native packed int4 (N, K//2)
-    # + per-output-row fp scales (no per-group scales/zeros).
+    # Q4_CR_W4A4 and Q4_CR_L share the ConvRot packed INT4 payload. The former
+    # runs INT4 activations; Q4_CR_L uses INT8 activations with the same layout.
     "Q4_CR_W4A4": (gguf.GGMLQuantizationType.I8, None),
+    "Q4_CR_L": (gguf.GGMLQuantizationType.I8, None),
     "Q4_CR": (gguf.GGMLQuantizationType.I8, None),  # Alias for Q4_CR_W4A4
     # Q4_PT is retired pending a performant Ampere W4A16 backend.
     # "Q4_PT": (gguf.GGMLQuantizationType.I8, None),
@@ -911,7 +945,10 @@ def plan_k_quantization(state_dict, model_arch, quant_type_name):
             plan[key] = gguf.GGMLQuantizationType.I8
         elif len(data.shape) == 1 or n_params <= QUANTIZATION_THRESHOLD or _k_matches_arch_pattern(key, model_arch.keys_hiprec):
             plan[key] = gguf.GGMLQuantizationType.F32
-        elif _k_matches_arch_pattern(key, model_arch.keys_noquant):
+        elif (
+            _k_matches_arch_pattern(key, model_arch.keys_noquant)
+            or _k_matches_arch_pattern(key, model_arch.keys_k_noquant)
+        ):
             plan[key] = _default_qtype(data)
         elif "conv" in key.lower():
             # K kernels are Linear-only. This also protects flattened Conv
@@ -924,7 +961,7 @@ def plan_k_quantization(state_dict, model_arch, quant_type_name):
                     f"{quant_type_name} cannot quantize tensor {key!r} with shape "
                     f"{tuple(data.shape)}: the quantized row dimension must be divisible "
                     f"by the {K_QUANT_BLOCK_SIZE}-value K-quant block size. Protect this "
-                    "tensor with keys_noquant or use a non-K quantization type."
+                    "tensor with keys_noquant/keys_k_noquant or use a non-K quantization type."
                 )
             plan[key] = base_qtype
             eligible_keys.append(key)
@@ -1156,11 +1193,13 @@ def quantize_int4_cr_w4a4(
     quant_group_size=64,
     device=None,
     dtype=torch.bfloat16,
+    backing="w4a4",
 ):
     """
-    Quantize a 2D Linear weight to the ConvRot W4A4 path (Q4_CR_W4A4, backed by
-    comfy_kitchen's fast int4 tensor-core MMA).
+    Quantize a 2D Linear weight to the ConvRot INT4 path for Q4_CR_W4A4 or Q4_CR_L.
 
+    ``backing`` selects activation precision: ``w4a4`` for INT4 activations or
+    ``w4a8`` for INT8 activations. Both use the same comfy_kitchen layout.
     Storage matches comfy_kitchen's TensorCoreConvRotW4A4Layout contract so the
     loader can rebuild a QuantizedTensor without re-packing:
       qweight:  (N, K//2) int8        two signed int4 per byte, row-major
@@ -1174,17 +1213,29 @@ def quantize_int4_cr_w4a4(
     runtime rotates the activation back) is symmetric about zero: 7-bit signed
     emission range [-7, 7] with scale = absmax / 7.
     """
+    if backing not in {"w4a4", "w4a8"}:
+        raise ValueError(f"Unsupported Q4_CR INT4 backing: {backing!r}")
     if device is not None:
         weight = weight.to(device)
     if quant_group_size != 64:
-        raise ValueError("Q4_CR W4A4 requires quant_group_size 64 (int4 MMA kernel contract).")
+        raise ValueError("Q4_CR requires quant_group_size 64 (ConvRot INT4 kernel contract).")
+    if (
+        not isinstance(convrot_groupsize, int)
+        or isinstance(convrot_groupsize, bool)
+        or convrot_groupsize <= 0
+    ):
+        raise ValueError(
+            f"Q4_CR ConvRot group size must be a positive integer, got {convrot_groupsize!r}."
+        )
     weight = weight.to(torch.float32)
+    if weight.ndim != 2:
+        raise ValueError(f"Q4_CR requires a 2D Linear weight, got shape {tuple(weight.shape)}.")
     orig_shape = tuple(weight.shape)
     n, k = orig_shape
 
     if k % convrot_groupsize != 0:
         raise ValueError(
-            f"Q4_CR W4A4 convrot group size {convrot_groupsize} must divide input "
+            f"Q4_CR ConvRot group size {convrot_groupsize} must divide input "
             f"features {k} for tensor {orig_shape}."
         )
 
@@ -1194,8 +1245,29 @@ def quantize_int4_cr_w4a4(
     weight_rotated = torch.matmul(weight_grouped, h.T).reshape(n, k).float()
 
     absmax = weight_rotated.abs().amax(dim=1, keepdim=True).clamp_min(1e-10)
-    scales = absmax / 7.0
-    q = (weight_rotated / scales).round().clamp(-7, 7).to(torch.int8)
+    scales_absmax = (absmax / 7.0).to(torch.float16).to(torch.float32).clamp_min(1e-10)
+
+    # Analytical 2-step Lloyd-Max / LSQ per-row scale optimization.
+    # Hadamard-rotated rows are near-Gaussian across K >= 256 elements, so
+    # setting scale = absmax / 7 lets single 4-sigma tail values compress 99.9%
+    # of weights into [-3, +3]. Optimizing per-row MSE at FP16 scale precision
+    # reduces 4-bit quantization error by ~30% while falling back to absmax / 7
+    # on rows (such as uniform/synthetic rows) where absmax is already optimal.
+    rms = weight_rotated.square().mean(dim=1, keepdim=True).sqrt().clamp_min(1e-10)
+    scales_opt = (rms * 0.355).clamp_max(scales_absmax)
+    for _ in range(2):
+        q_opt = (weight_rotated / scales_opt.clamp_min(1e-10)).round().clamp(-7, 7)
+        denom = q_opt.square().sum(dim=1, keepdim=True).clamp_min(1e-10)
+        scales_opt = (q_opt * weight_rotated).sum(dim=1, keepdim=True) / denom
+    scales_opt = scales_opt.clamp_min(1e-10).to(torch.float16).to(torch.float32).clamp_min(1e-10)
+
+    q_abs = (weight_rotated / scales_absmax).round().clamp(-7, 7)
+    q_opt = (weight_rotated / scales_opt).round().clamp(-7, 7)
+    err_abs = (q_abs * scales_absmax - weight_rotated).square().sum(dim=1, keepdim=True)
+    err_opt = (q_opt * scales_opt - weight_rotated).square().sum(dim=1, keepdim=True)
+    use_opt = err_opt < err_abs
+    scales = torch.where(use_opt, scales_opt, scales_absmax)
+    q = torch.where(use_opt, q_opt, q_abs).to(torch.int8)
 
     q_flat = q.to(torch.int32)
     lo = q_flat[:, 0::2] & 0x0F
@@ -1206,12 +1278,14 @@ def quantize_int4_cr_w4a4(
 
     quant_conf = {
         "format": "int4_cr",
-        "backing": "w4a4",
+        "backing": backing,
         "convrot_groupsize": convrot_groupsize,
         "quant_group_size": quant_group_size,
         "orig_shape": orig_shape,
         "sym": True,
     }
+    if backing == "w4a8":
+        quant_conf["linear_dtype"] = "int8"
     return packed, wscales, quant_conf, orig_shape
 
 
@@ -1443,7 +1517,7 @@ def parse_args():
         choices=QUANTIZATION_DEVICE_OPTIONS,
         default="auto",
         help=(
-            "Device for Q8_CR conversion. auto uses CUDA when available; CPU remains "
+            "Device for Q8_CR and Q4_CR conversion. auto uses CUDA when available; CPU remains "
             "the fallback for individual matrices that cannot fit in available VRAM."
         ),
     )
@@ -1628,6 +1702,10 @@ def handle_tensors(
         for dim_size in data_shape:
             n_params *= dim_size
 
+        q8_cr_patterns = list(model_arch.keys_q8_cr)
+        if quant_type_name == "Q4_CR_L":
+            q8_cr_patterns.extend(getattr(model_arch, "keys_q8_cr_l", ()))
+
         apply_quantization_rules = (
             quant_type_name == "Q8_CR"
             or (
@@ -1664,7 +1742,7 @@ def handle_tensors(
                 # "last.modulation.lin" needs full F32, even though the
                 # broader "^last." keys_noquant entry also matches it).
                 data_qtype = gguf.GGMLQuantizationType.F32
-            elif key_matches(key, model_arch.keys_q8_cr) and quant_type_name in {"Q4_CR", "Q4_CR_W4A4"}:
+            elif key_matches(key, q8_cr_patterns) and quant_type_name in {"Q4_CR", "Q4_CR_W4A4", "Q4_CR_L"}:
                 data_qtype = gguf.GGMLQuantizationType.I8
             elif key_matches(key, model_arch.keys_noquant):
                 pass
@@ -1686,18 +1764,22 @@ def handle_tensors(
         # Q4_PT layout restrictions are retained with
         # retired_quantize_int4_pytorch and are intentionally not selectable.
 
-        # Q4_CR_W4A4 only supports Linear matrices whose K dimension is divisible
-        # by the ConvRot group size (default 256). Anything else falls back to F16
+        # Q4_CR_W4A4 and Q4_CR_L only support Linear matrices whose K dimension
+        # is divisible by the ConvRot group size (default 256). Others fall back to F16
         # to avoid a conversion-time crash on awkward shapes.
         if (
-            quant_type_name in {"Q4_CR_W4A4", "Q4_CR"}
+            quant_type_name in {"Q4_CR_W4A4", "Q4_CR", "Q4_CR_L"}
+            and n_dims > 1
             and (
                 n_dims != 2
-                or data.shape[1] % Q4_CR_W4A4_CONVROT_GROUP_SIZE != 0
+                or (
+                    n_params > QUANTIZATION_THRESHOLD
+                    and data.shape[1] % Q4_CR_W4A4_CONVROT_GROUP_SIZE != 0
+                )
             )
             and not key_matches(key, model_arch.keys_hiprec)
             and not key_matches(key, model_arch.keys_noquant)
-            and not key_matches(key, model_arch.keys_q8_cr)
+            and not key_matches(key, q8_cr_patterns)
             and not raw_byte_tensor
         ):
             data_qtype = gguf.GGMLQuantizationType.F16
@@ -1721,8 +1803,8 @@ def handle_tensors(
             and (
                 quant_type_name == "Q8_CR"
                 or (
-                    quant_type_name in {"Q4_CR", "Q4_CR_W4A4"}
-                    and key_matches(key, model_arch.keys_q8_cr)
+                    quant_type_name in {"Q4_CR", "Q4_CR_W4A4", "Q4_CR_L"}
+                    and key_matches(key, q8_cr_patterns)
                 )
             )
         ):
@@ -1768,17 +1850,17 @@ def handle_tensors(
                 progress_callback("quantize", progress_offset + tensor_index, progress_total or len(state_dict))
             continue
 
-        # Q4_CR_W4A4: custom W4A4 INT4 backed by comfy_kitchen's fast ConvRot
-        # int4 tensor-core MMA. Serializes kitchen-native packed int4 (N, K//2)
+        # Q4_CR_W4A4 / Q4_CR_L: custom ConvRot INT4 backed by comfy_kitchen's
+        # ConvRot kernel (INT4 or INT8 activations). Serializes packed int4 (N, K//2)
         # + per-output-row fp scales (no per-group scales/zeros).
         if (
-            quant_type_name in {"Q4_CR_W4A4", "Q4_CR"}
+            quant_type_name in {"Q4_CR_W4A4", "Q4_CR", "Q4_CR_L"}
             and data_qtype == gguf.GGMLQuantizationType.I8
             and n_dims == 2
             and data.shape[1] % Q4_CR_W4A4_CONVROT_GROUP_SIZE == 0
             and not key_matches(key, model_arch.keys_hiprec)
             and not key_matches(key, model_arch.keys_noquant)
-            and not key_matches(key, model_arch.keys_q8_cr)
+            and not key_matches(key, q8_cr_patterns)
         ):
             qdata_q4 = torch.from_numpy(data)
             if q4_cr_device is None:
@@ -1790,13 +1872,14 @@ def handle_tensors(
                     convrot_groupsize=Q4_CR_W4A4_CONVROT_GROUP_SIZE,
                     quant_group_size=Q4_CR_W4A4_QUANT_GROUP_SIZE,
                     device=device,
+                    backing="w4a8" if quant_type_name == "Q4_CR_L" else "w4a4",
                 )
             except torch.OutOfMemoryError:
                 if device.type != "cuda":
                     raise
                 torch.cuda.empty_cache()
                 logging.warning(
-                    "Q4_CR_W4A4 CUDA fallback for %s: CUDA ran out of memory while quantizing.",
+                    "Q4_CR CUDA fallback for %s: CUDA ran out of memory while quantizing.",
                     key,
                 )
                 qdata, wscales, quant_conf, orig_shape = quantize_int4_cr_w4a4(
@@ -1804,6 +1887,7 @@ def handle_tensors(
                     convrot_groupsize=Q4_CR_W4A4_CONVROT_GROUP_SIZE,
                     quant_group_size=Q4_CR_W4A4_QUANT_GROUP_SIZE,
                     device=torch.device("cpu"),
+                    backing="w4a8" if quant_type_name == "Q4_CR_L" else "w4a4",
                 )
             writer.add_tensor(
                 key,
