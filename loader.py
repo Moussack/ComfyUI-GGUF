@@ -12,7 +12,7 @@ from .ops import GGMLTensor
 from .dequant import is_quantized, dequantize_tensor
 from .quant_ops import make_quantized
 
-IMG_ARCH_LIST = {"flux", "flux3", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "ltxv_upscaler", "hyvid", "wan", "lumina2", "qwen_image", "qwen_image21", "ideogram", "krea2", "minimax_h3", "minimax_h3_vae", "minimax_music3"}
+IMG_ARCH_LIST = {"flux", "flux3", "sd1", "sdxl", "sd3", "aura", "hidream", "cosmos", "ltxv", "ltxv_upscaler", "hyvid", "wan", "lumina2", "qwen_image", "qwen_image21", "ideogram", "krea2", "minimax_h3", "minimax_h3_vae", "minimax_music3", "moss_image"}
 TXT_ARCH_LIST = {"t5", "t5encoder", "llama", "qwen2vl", "qwen3", "qwen3vl", "qwen35", "gemma3", "gemma4", "minimax_music3"}
 VIS_TYPE_LIST = {"clip-vision", "mmproj"}
 RAW_BYTE_TENSOR_KEYS = frozenset(("tokenizer_json", "spiece_model", "tekken_model"))
@@ -205,7 +205,7 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
     } | {
         tensor_name
         for key, quant_conf in custom_quant_configs.items()
-        if quant_conf.get("format") == "int4_cr"
+        if quant_conf.get("format") in {"int4_cr", "int1_cr"}
         for tensor_name in (key, f"{key}_scale")
     }
 
@@ -299,11 +299,28 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
         for quant_conf in custom_quant_configs.values()
         if quant_conf.get("format") == "int4_cr"
     }
+    int1_formats = {
+        quant_conf.get("backing")
+        for quant_conf in custom_quant_configs.values()
+        if quant_conf.get("format") == "int1_cr"
+    }
+    if int1_formats and int4_backings:
+        raise ValueError("GGUF mixes incompatible Q1_CR_XL and Q4_CR custom formats.")
+    if len(int1_formats) > 1:
+        raise ValueError(
+            f"GGUF mixes incompatible Q1_CR_XL backings: {sorted(map(str, int1_formats))!r}"
+        )
     if len(int4_backings) > 1:
         raise ValueError(
             f"GGUF mixes incompatible Q4_CR backings: {sorted(map(str, int4_backings))!r}"
         )
-    if int4_backings == {"w4a4"}:
+    if int1_formats == {"w1a16"}:
+        extra["gguf_quant_mode"] = "int1_cr_xl"
+    elif int1_formats:
+        raise ValueError(
+            f"Unsupported Q1_CR_XL backing: {sorted(map(str, int1_formats))!r}"
+        )
+    elif int4_backings == {"w4a4"}:
         extra["gguf_quant_mode"] = "int4_cr_w4a4"
     elif int4_backings == {"w4a8"}:
         extra["gguf_quant_mode"] = "int4_cr_w4a8"
@@ -427,6 +444,59 @@ def gguf_sd_loader(path, handle_prefix="model.diffusion_model.", is_text_model=F
             raise ValueError(
                 f"Unsupported Q4_CR backing for {weight_key}: {quant_conf.get('backing')!r}. "
                 "Reconvert with --quant-type Q4_CR_W4A4 or Q4_CR_L."
+            )
+        elif fmt == "int1_cr" and quant_conf.get("backing") == "w1a16":
+            orig_shape = tuple(quant_conf.get("orig_shape", ()))
+            if (
+                len(orig_shape) != 2
+                or not all(isinstance(dim, int) and not isinstance(dim, bool) and dim > 0 for dim in orig_shape)
+            ):
+                raise ValueError(f"Invalid Q1_CR_XL original shape for {weight_key}: {orig_shape!r}")
+            n, k = orig_shape
+            convrot_groupsize = quant_conf.get("convrot_groupsize")
+            quant_group_size = quant_conf.get("quant_group_size")
+            if (
+                quant_conf.get("linear_dtype") != "bf16"
+                or quant_conf.get("weight_rotated") is not True
+                or convrot_groupsize != 256
+                or quant_group_size != 64
+                or k % convrot_groupsize
+                or k % quant_group_size
+            ):
+                raise ValueError(
+                    f"Invalid Q1_CR_XL format metadata for {weight_key}: "
+                    f"linear_dtype={quant_conf.get('linear_dtype')!r}, "
+                    f"convrot_groupsize={convrot_groupsize!r}, "
+                    f"quant_group_size={quant_group_size!r}."
+                )
+            packed_shape = (n, k // 8)
+            scale_shape = (n, k // quant_group_size)
+            packed = weight_ggml.data.view(torch.int8).reshape(packed_shape)
+            scale = scale_ggml.data.view(torch.float16).reshape(scale_shape)
+            if tuple(getattr(weight_ggml, "tensor_shape", weight_ggml.shape)) != packed_shape:
+                raise ValueError(
+                    f"Invalid Q1_CR_XL packed tensor for {weight_key}: "
+                    f"expected {packed_shape}, got "
+                    f"{tuple(getattr(weight_ggml, 'tensor_shape', weight_ggml.shape))}."
+                )
+            if tuple(getattr(scale_ggml, "tensor_shape", scale_ggml.shape)) != scale_shape:
+                raise ValueError(
+                    f"Invalid Q1_CR_XL scale tensor for {weight_key}: "
+                    f"expected {scale_shape}, got "
+                    f"{tuple(getattr(scale_ggml, 'tensor_shape', scale_ggml.shape))}."
+                )
+
+            layer_prefix = weight_key[:weight_key.rfind("weight")]
+            state_dict[weight_key] = torch.nn.Parameter(packed, requires_grad=False)
+            state_dict[scale_key] = torch.nn.Parameter(scale, requires_grad=False)
+            state_dict[f"{layer_prefix}comfy_quant"] = torch.nn.Parameter(
+                torch.tensor(list(json.dumps(quant_conf).encode("utf-8")), dtype=torch.uint8),
+                requires_grad=False,
+            )
+        elif fmt == "int1_cr":
+            raise ValueError(
+                f"Unsupported Q1_CR_XL backing for {weight_key}: {quant_conf.get('backing')!r}. "
+                "Reconvert with --quant-type Q1_CR_XL."
             )
 
     return (state_dict, extra)

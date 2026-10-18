@@ -2,6 +2,8 @@ import unittest
 import json
 import gc
 import os
+import subprocess
+import sys
 from contextlib import ExitStack, nullcontext
 from collections import OrderedDict
 from types import SimpleNamespace
@@ -30,6 +32,7 @@ from tools.convert import (
     ModelMiniMaxMusic3DiT,
     ModelMiniMaxMusic3TextEncoder,
     ModelFlux3,
+    ModelMOSSImage,
     ModelQwen3,
     ModelQwen3VL,
     ModelQwenImage21,
@@ -50,6 +53,7 @@ from tools.convert import (
     quantize_k,
     quantize_int8_convrot,
     quantize_int4_cr_w4a4,
+    quantize_int1_cr_xl,
     resolve_quantization_device,
 )
 from dequant import dequantize, dequantize_functions, dequantize_tensor
@@ -992,6 +996,246 @@ class QwenImage21ConversionTests(unittest.TestCase):
             tensor_types["img_in.weight"],
             gguf.GGMLQuantizationType.BF16,
         )
+
+
+class MOSSImageConversionTests(unittest.TestCase):
+    @staticmethod
+    def _source_state_dict():
+        dtype = torch.bfloat16
+        dim = 512
+        ffn_dim = 1024
+        return {
+            "rope.bands": torch.ones(16, dtype=torch.float32),
+            "final_linear_video.weight": torch.randn((128, dim), dtype=dtype),
+            "final_norm_video.weight": torch.ones(dim, dtype=dtype),
+            "layers.0.k_norm.weight": torch.ones(128, dtype=dtype),
+            "layers.0.norm1.weight": torch.ones(dim, dtype=dtype),
+            "layers.0.norm2.weight": torch.ones(dim, dtype=dtype),
+            "layers.0.proj.ffn_down.weight": torch.randn((dim, ffn_dim), dtype=dtype),
+            "layers.0.proj.ffn_up_gate.weight": torch.randn((2 * ffn_dim, dim), dtype=dtype),
+            "layers.0.proj.o.weight": torch.randn((dim, dim), dtype=dtype),
+            "layers.0.proj.qkv.weight": torch.randn((3 * dim, dim), dtype=dtype),
+            "layers.0.q_norm.weight": torch.ones(128, dtype=dtype),
+            "shared_block_modulation.weight": torch.randn((6 * dim, dim), dtype=dtype),
+            "text_embedder.proj.weight": torch.randn((dim, 4096), dtype=dtype),
+            "text_embedder.blocks.0.qkv.weight": torch.randn((3 * dim, dim), dtype=dtype),
+            "time_embedding.0.weight": torch.randn((dim, 256), dtype=dtype),
+            "video_embedder.weight": torch.randn((dim, 128), dtype=dtype),
+            "video_head_modulation.weight": torch.randn((2 * dim, dim), dtype=dtype),
+        }
+
+    def test_detects_moss_image_from_distinctive_transformer_keys(self):
+        model_arch = detect_arch(self._source_state_dict())
+
+        self.assertIsInstance(model_arch, ModelMOSSImage)
+        self.assertEqual(model_arch.arch, "moss_image")
+        self.assertIn("^text_embedder.", model_arch.keys_noquant)
+        self.assertIn("^rope.bands", model_arch.keys_ignore)
+
+    def test_converts_and_loads_moss_image_gguf_in_static_and_dynamic_modes(self):
+        state_dict = self._source_state_dict()
+        with TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "moss-image.safetensors"
+            output_path = Path(temp_dir) / "moss-image-Q4_0.gguf"
+            save_file(state_dict, str(source_path))
+            converted_path, model_arch = convert_file(
+                str(source_path),
+                str(output_path),
+                interact=False,
+                quant_type_name="Q4_0",
+                streamed=True,
+            )
+
+            reader = gguf.GGUFReader(converted_path)
+            tensor_types = {tensor.name: tensor.tensor_type for tensor in reader.tensors}
+            architecture = reader.get_field("general.architecture").contents()
+            reader.tensors.clear()
+            reader.fields.clear()
+            reader.data._mmap.close()
+            del reader
+
+            loader = load_gguf_loader()
+            for dynamic in (False, True):
+                loaded, extra = loader.gguf_sd_loader(
+                    converted_path,
+                    handle_prefix=None,
+                    dynamic=dynamic,
+                )
+                self.assertEqual(extra["arch_str"], "moss_image")
+                weight = loaded["layers.0.proj.ffn_up_gate.weight"]
+                if dynamic:
+                    loaded_shape = tuple(weight._params.orig_shape)
+                else:
+                    loaded_shape = tuple(weight.tensor_shape)
+                self.assertEqual(loaded_shape, (2048, 512))
+                del loaded, weight
+                gc.collect()
+
+        self.assertIsInstance(model_arch, ModelMOSSImage)
+        self.assertEqual(architecture, "moss_image")
+        self.assertNotIn("rope.bands", tensor_types)
+        self.assertEqual(
+            tensor_types["layers.0.proj.ffn_up_gate.weight"],
+            gguf.GGMLQuantizationType.Q4_0,
+        )
+        self.assertEqual(
+            tensor_types["text_embedder.blocks.0.qkv.weight"],
+            gguf.GGMLQuantizationType.BF16,
+        )
+        self.assertEqual(
+            tensor_types["shared_block_modulation.weight"],
+            gguf.GGMLQuantizationType.BF16,
+        )
+        self.assertEqual(
+            tensor_types["final_linear_video.weight"],
+            gguf.GGMLQuantizationType.BF16,
+        )
+
+    def test_q4_cr_keeps_moss_attention_in_q8_cr(self):
+        with TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "moss-image-Q4_CR.gguf"
+            converted_path, _ = convert_state_dict(
+                self._source_state_dict(),
+                str(output_path),
+                quant_type_name="Q4_CR",
+                quantization_device="cpu",
+            )
+
+            reader = gguf.GGUFReader(converted_path)
+            qkv_field = reader.get_field(
+                "comfy.gguf.quant.layers.0.proj.qkv.weight"
+            )
+            qkv_conf = json.loads(str(qkv_field.parts[qkv_field.data[-1]], "utf-8"))
+            mlp_field = reader.get_field(
+                "comfy.gguf.quant.layers.0.proj.ffn_up_gate.weight"
+            )
+            mlp_conf = json.loads(str(mlp_field.parts[mlp_field.data[-1]], "utf-8"))
+            del qkv_field, mlp_field
+            reader.tensors.clear()
+            reader.fields.clear()
+            reader.data._mmap.close()
+            del reader
+
+            loader = load_gguf_loader()
+            for dynamic in (False, True):
+                loaded, extra = loader.gguf_sd_loader(
+                    converted_path,
+                    handle_prefix=None,
+                    dynamic=dynamic,
+                )
+                self.assertEqual(extra["gguf_quant_mode"], "int4_cr_w4a4")
+                self.assertIn("layers.0.proj.qkv.comfy_quant", loaded)
+                del loaded
+                gc.collect()
+
+        self.assertEqual(qkv_conf["format"], "int8_tensorwise")
+        self.assertEqual(mlp_conf["format"], "int4_cr")
+        self.assertEqual(mlp_conf["backing"], "w4a4")
+
+    def test_installed_comfyui_core_detects_moss_image_when_supported(self):
+        from comfy.model_detection import detect_unet_config
+
+        config = detect_unet_config(self._source_state_dict(), "")
+        if config is None:
+            self.skipTest(
+                "Installed ComfyUI predates core MOSS-Image support "
+                "(upstream commit e087d8f6)."
+            )
+        self.assertEqual(config["image_model"], "moss_image")
+
+    def test_standalone_converter_fuses_split_qkv_lora_without_pythonpath(self):
+        from comfy.model_detection import detect_unet_config
+
+        source = self._source_state_dict()
+        if detect_unet_config(source, "") is None:
+            self.skipTest(
+                "Installed ComfyUI predates core MOSS-Image support "
+                "(upstream commit e087d8f6)."
+            )
+
+        dim = source["layers.0.proj.qkv.weight"].shape[1]
+        source["layers.0.proj.qkv.weight"] = torch.zeros_like(
+            source["layers.0.proj.qkv.weight"]
+        )
+        lora = {}
+        for projection in ("q", "k", "v"):
+            target = f"diffusion_model.layers.0.proj.{projection}"
+            down = torch.zeros((1, dim), dtype=torch.float16)
+            down[0, 0] = 1
+            up = torch.zeros((dim, 1), dtype=torch.float16)
+            up[0, 0] = 1
+            lora[f"{target}.lora_down.weight"] = down
+            lora[f"{target}.lora_up.weight"] = up
+            lora[f"{target}.alpha"] = torch.tensor(1.0)
+
+        with TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "moss-image.safetensors"
+            lora_path = Path(temp_dir) / "moss-image-lora.safetensors"
+            output_path = Path(temp_dir) / "moss-image-lora.gguf"
+            save_file(source, str(source_path))
+            save_file(lora, str(lora_path))
+
+            env = os.environ.copy()
+            env.pop("PYTHONPATH", None)
+            repo_root = Path(__file__).parents[1]
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(repo_root / "tools" / "convert.py"),
+                    "--src",
+                    str(source_path),
+                    "--dst",
+                    str(output_path),
+                    "--lora",
+                    str(lora_path),
+                    "--lora-strength",
+                    "0.7",
+                    "--quantization-device",
+                    "cpu",
+                    "--quant-type",
+                    "F16",
+                ],
+                cwd=repo_root,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"Converter failed without PYTHONPATH:\n{result.stdout}\n{result.stderr}",
+            )
+
+            reader = gguf.GGUFReader(str(output_path))
+            try:
+                tensor = next(
+                    tensor
+                    for tensor in reader.tensors
+                    if tensor.name == "layers.0.proj.qkv.weight"
+                )
+                merged = torch.from_numpy(tensor.data.copy()).view(torch.float16).reshape(
+                    tuple(reversed(tensor.shape))
+                )
+            finally:
+                reader.tensors.clear()
+                reader.fields.clear()
+                reader.data._mmap.close()
+
+        self.assertTrue(
+            torch.equal(
+                merged[[0, dim, 2 * dim], 0],
+                torch.full(
+                    (3,),
+                    torch.tensor(0.7, dtype=torch.bfloat16).to(torch.float16).item(),
+                    dtype=torch.float16,
+                ),
+            ),
+            f"Unexpected fused Q/K/V values: {merged[[0, dim, 2 * dim], 0]}",
+        )
+        self.assertEqual(torch.count_nonzero(merged).item(), 3)
 
 
 class QwenImage21InferenceFallbackTests(unittest.TestCase):
@@ -4542,6 +4786,276 @@ class Q4CRW4A4QuantizationTests(unittest.TestCase):
             self.assertIsNone(ops_module._configure_perf_logger())
         with mock.patch.dict(os.environ, {ops_module._PERF_LOG_ENV: ""}):
             self.assertIsNone(ops_module._configure_perf_logger())
+
+
+class Q1CRXLQuantizationTests(unittest.TestCase):
+    def test_int1_sign_packing_uses_little_endian_bits_and_group_scales(self):
+        from q1_cr_triton_backend import pack_int1_sign_bits, unpack_int1_sign_bits
+
+        signs = torch.tensor([0, 1] * 32, dtype=torch.float32)
+        weight = torch.where(signs > 0, 2.0, -2.0).reshape(1, 64)
+        packed, scales = pack_int1_sign_bits(weight)
+
+        self.assertEqual(packed.shape, (1, 8))
+        self.assertEqual(packed.dtype, torch.int8)
+        self.assertEqual(packed.view(torch.uint8)[0, 0].item(), 0xAA)
+        self.assertEqual(scales.shape, (1, 1))
+        self.assertEqual(scales.dtype, torch.float16)
+        self.assertEqual(scales.item(), 2.0)
+        decoded = unpack_int1_sign_bits(packed, scales, dtype=torch.float32)
+        torch.testing.assert_close(decoded, weight)
+
+    def test_int1_cr_xl_quantization_and_linear_match_dense_reference(self):
+        from q1_cr_triton_backend import (
+            dequantize_q1_cr_xl_weight,
+            q1_cr_xl_linear,
+        )
+
+        torch.manual_seed(17)
+        weight = torch.randn(8, 512, dtype=torch.float32)
+        packed, scales, quant_conf, orig_shape = quantize_int1_cr_xl(
+            weight,
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(packed.shape, (8, 64))
+        self.assertEqual(packed.dtype, torch.int8)
+        self.assertEqual(scales.shape, (8, 8))
+        self.assertEqual(scales.dtype, torch.float16)
+        self.assertEqual(orig_shape, (8, 512))
+        self.assertEqual(quant_conf["format"], "int1_cr")
+        self.assertEqual(quant_conf["backing"], "w1a16")
+        self.assertEqual(quant_conf["linear_dtype"], "bf16")
+        self.assertEqual(quant_conf["convrot_groupsize"], 256)
+        self.assertEqual(quant_conf["quant_group_size"], 64)
+
+        dense = dequantize_q1_cr_xl_weight(
+            packed,
+            scales,
+            orig_shape,
+            dtype=torch.float32,
+        )
+        x = torch.randn(3, 512, dtype=torch.float32)
+        bias = torch.randn(8, dtype=torch.float32)
+        actual = q1_cr_xl_linear(
+            x,
+            packed,
+            scales,
+            bias=bias,
+            orig_shape=orig_shape,
+        )
+        expected = torch.nn.functional.linear(x, dense, bias)
+        torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is unavailable")
+    def test_int1_cr_xl_cuda_triton_decode_matches_rotated_dense_reference(self):
+        import q1_cr_triton_backend as backend
+
+        if backend.triton is None:
+            self.skipTest("Triton is unavailable")
+        torch.manual_seed(29)
+        weight = torch.randn(8, 512, device="cuda", dtype=torch.bfloat16)
+        packed, scales, _, orig_shape = quantize_int1_cr_xl(
+            weight,
+            device=torch.device("cuda"),
+        )
+        x = torch.randn(2, 512, device="cuda", dtype=torch.bfloat16)
+        bias = torch.randn(8, device="cuda", dtype=torch.bfloat16)
+        actual = backend.q1_cr_xl_linear(
+            x,
+            packed,
+            scales,
+            bias=bias,
+            orig_shape=orig_shape,
+        )
+        x_rotated = backend._rotate_activation(x, 256)
+        weight_rotated = backend.unpack_int1_sign_bits(
+            packed,
+            scales,
+            dtype=x.dtype,
+        )
+        expected = torch.nn.functional.linear(x_rotated, weight_rotated, bias)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    def test_q1_cr_xl_conversion_loader_webui_and_qwen21_dispatch(self):
+        state_dict = {
+            "txt_in.text_norm.weight": torch.ones(16, dtype=torch.bfloat16),
+            "modulation.1.weight": torch.ones((32, 16), dtype=torch.bfloat16),
+            "transformer_blocks.0.attn.norm_q.weight": torch.ones(4, dtype=torch.bfloat16),
+            "transformer_blocks.0.attn.to_q.weight": torch.randn((64, 512), dtype=torch.bfloat16),
+            "transformer_blocks.0.img_mlp.gate_up.weight": torch.randn((64, 512), dtype=torch.bfloat16),
+            "transformer_blocks.0.img_mlp.out.weight": torch.randn((64, 512), dtype=torch.bfloat16),
+            "transformer_blocks.0.img_mlp.unaligned.weight": torch.randn((64, 300), dtype=torch.bfloat16),
+            "img_in.weight": torch.ones((16, 64), dtype=torch.bfloat16),
+            "proj_out.weight": torch.ones((64, 16), dtype=torch.bfloat16),
+        }
+
+        self.assertIn("Q1_CR_XL", QUANT_TYPE_MAP)
+        with TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "qwen-image-2.1-Q1_CR_XL.gguf"
+            converted_path, model_arch = convert_state_dict(
+                state_dict,
+                str(output_path),
+                quant_type_name="Q1_CR_XL",
+                quantization_device="cpu",
+            )
+            reader = gguf.GGUFReader(converted_path)
+            tensor_types = {tensor.name: tensor.tensor_type for tensor in reader.tensors}
+            q1_field = reader.get_field(
+                "comfy.gguf.quant.transformer_blocks.0.img_mlp.gate_up.weight"
+            )
+            q1_conf = json.loads(str(q1_field.parts[q1_field.data[-1]], "utf-8"))
+            reader.tensors.clear()
+            reader.fields.clear()
+            reader.data._mmap.close()
+            del reader
+
+            self.assertIsInstance(model_arch, ModelQwenImage21)
+            self.assertEqual(
+                tensor_types["transformer_blocks.0.attn.to_q.weight"],
+                gguf.GGMLQuantizationType.I8,
+            )
+            self.assertEqual(
+                tensor_types["transformer_blocks.0.attn.to_q.weight_scale"],
+                gguf.GGMLQuantizationType.F32,
+            )
+            self.assertEqual(
+                tensor_types["transformer_blocks.0.img_mlp.gate_up.weight"],
+                gguf.GGMLQuantizationType.I8,
+            )
+            self.assertEqual(
+                tensor_types["transformer_blocks.0.img_mlp.gate_up.weight_scale"],
+                gguf.GGMLQuantizationType.F16,
+            )
+            self.assertEqual(
+                tensor_types["transformer_blocks.0.img_mlp.unaligned.weight"],
+                gguf.GGMLQuantizationType.F16,
+            )
+            self.assertEqual(q1_conf["orig_shape"], [64, 512])
+            self.assertEqual(q1_conf["quant_group_size"], 64)
+
+            loader = load_gguf_loader()
+            loaded, extra = loader.gguf_sd_loader(converted_path)
+            self.assertEqual(extra["gguf_quant_mode"], "int1_cr_xl")
+            self.assertIn("int1_cr", extra["gguf_quant_formats"])
+            dynamic_loaded, dynamic_extra = loader.gguf_sd_loader(
+                converted_path,
+                dynamic=True,
+            )
+            self.assertEqual(dynamic_extra["gguf_quant_mode"], "int1_cr_xl")
+            del dynamic_loaded, dynamic_extra
+            gc.collect()
+            ops_type = nodes_factory()._legacy_gguf_ops(extra)
+            q1_layer = ops_type.Linear(512, 64, bias=False)
+            prefix = "transformer_blocks.0.img_mlp.gate_up."
+            q1_layer._load_from_state_dict(
+                loaded,
+                prefix=prefix,
+                local_metadata={},
+                strict=True,
+                missing_keys=[],
+                unexpected_keys=[],
+                error_msgs=[],
+            )
+            self.assertEqual(q1_layer._quantized_format, "int1_cr")
+            self.assertEqual(tuple(q1_layer.weight.shape), (64, 64))
+            self.assertEqual(tuple(q1_layer.weight_scale.shape), (64, 8))
+
+            x = torch.randn(2, 512, dtype=torch.float32)
+            actual = q1_layer(x)
+            expected = torch.nn.functional.linear(
+                x,
+                q1_layer._dequantized_weight(torch.device("cpu"), x.dtype),
+            )
+            torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+            del q1_layer, loaded
+            gc.collect()
+
+        node_module = nodes_factory()
+        choices = node_module.TargetedQuantizationGGUF.INPUT_TYPES()["required"]["quantization"][0]
+        self.assertIn("Q1_CR_XL", choices)
+        from tools import conversion_webui
+        page = conversion_webui.PAGE.read_text(encoding="utf-8")
+        self.assertIn('name="quant_type" value="Q1_CR_XL"', page)
+        self.assertIn('<option value="Q1_CR_XL">', page)
+
+    def test_q1_cr_xl_supports_native_and_fused_lora_patches(self):
+        from comfy.weight_adapter import LoRAAdapter
+        from q1_cr_triton_backend import pack_int1_sign_bits
+
+        ops_type = ops_factory()
+        layer = ops_type.Linear(512, 8, bias=False)
+        weight = torch.randn(8, 512, dtype=torch.float32)
+        from tools.convert import _build_regular_hadamard
+        hadamard = _build_regular_hadamard(256, dtype=torch.float32, device="cpu")
+        rotated = (
+            weight.reshape(8, 2, 256) @ hadamard.T
+        ).reshape(8, 512)
+        packed, scales = pack_int1_sign_bits(rotated)
+        quant_conf = {
+            "format": "int1_cr",
+            "backing": "w1a16",
+            "linear_dtype": "bf16",
+            "convrot_groupsize": 256,
+            "quant_group_size": 64,
+            "orig_shape": [8, 512],
+            "weight_rotated": True,
+        }
+        layer._load_from_state_dict(
+            {
+                "weight": packed,
+                "weight_scale": scales,
+                "comfy_quant": torch.tensor(
+                    list(json.dumps(quant_conf).encode("utf-8")),
+                    dtype=torch.uint8,
+                ),
+            },
+            prefix="",
+            local_metadata={},
+            strict=True,
+            missing_keys=[],
+            unexpected_keys=[],
+            error_msgs=[],
+        )
+
+        rank = 4
+        up = torch.randn(8, rank, dtype=torch.float32)
+        down = torch.randn(rank, 512, dtype=torch.float32)
+        adapter = LoRAAdapter(set(), (up, down, float(rank), None, None, None))
+        key = "blocks.0.weight"
+        patches = {key: [(0.5, adapter, 1.0, None, None)]}
+
+        class FakeLowVramPatch:
+            is_lowvram_patch = True
+
+            def __init__(self):
+                self.key = key
+                self.patches = patches
+                self.prepared_patches = None
+
+            def __call__(self, value):
+                return value
+
+        x = torch.randn(3, 512, dtype=torch.float32)
+        base = layer(x)
+        layer.weight_function = [FakeLowVramPatch()]
+        native = layer(x)
+        expected_native = base + 0.5 * torch.nn.functional.linear(
+            torch.nn.functional.linear(x, down),
+            up,
+        )
+        torch.testing.assert_close(native, expected_native, atol=2e-4, rtol=2e-4)
+        self.assertIsNone(layer._fused_weight)
+
+        layer.weight_function = [lambda value, *args, **kwargs: value + 0.125]
+        fused = layer(x)
+        self.assertIsNotNone(layer._fused_weight)
+        expected_fused = torch.nn.functional.linear(
+            x,
+            layer._fused_weight.to(dtype=x.dtype),
+        )
+        torch.testing.assert_close(fused, expected_fused, atol=2e-4, rtol=2e-4)
 
 
 if __name__ == "__main__":
