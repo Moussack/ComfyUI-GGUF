@@ -15,7 +15,11 @@ from tqdm import tqdm
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+comfy_root = os.path.dirname(os.path.dirname(repo_root))
+if os.path.isfile(os.path.join(comfy_root, "comfy", "sd.py")):
+    sys.path.insert(0, comfy_root)
+sys.path.insert(0, repo_root)
 from lora import (
     fuse_target_entries_into_tensor,
     fuse_targets_into_state_dict,
@@ -522,11 +526,37 @@ class ModelQwenImage21(ModelTemplate):
     ]
 
 
+class ModelMOSSImage(ModelTemplate):
+    arch = "moss_image"
+    keys_detect = [
+        (
+            "shared_block_modulation.weight",
+            "layers.0.proj.ffn_up_gate.weight",
+            "layers.0.proj.qkv.weight",
+            "video_embedder.weight",
+            "final_linear_video.weight",
+        )
+    ]
+    keys_noquant = [
+        "^text_embedder.",
+        "^time_embedding.",
+        "^shared_block_modulation.",
+        "^video_embedder.",
+        "^video_head_modulation.",
+        "^final_linear_video.",
+    ]
+    keys_q8_cr = [
+        "^layers.*.proj.qkv.weight",
+        "^layers.*.proj.o.weight",
+    ]
+    keys_ignore = ["^rope.bands"]
+
+
 arch_list = [ModelFlux, ModelFlux3, ModelSD3, ModelAura, ModelHiDream, CosmosPredict2,
              ModelLTXV, ModelLTXVUpsampler, ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2,
              ModelKrea2, ModelIdeogram, ModelMinimaxH3, ModelMinimaxH3VAE,
              ModelMiniMaxMusic3DiT, ModelMiniMaxMusic3TextEncoder, ModelQwen3, ModelQwen3VL,
-             ModelQwenImage21]
+             ModelQwenImage21, ModelMOSSImage]
 
 QWEN3_HF_KEY_MAP = {
     "embed_tokens.weight": "token_embd.weight",
@@ -771,6 +801,8 @@ QUANT_TYPE_MAP = {
     "Q4_CR_W4A4": (gguf.GGMLQuantizationType.I8, None),
     "Q4_CR_L": (gguf.GGMLQuantizationType.I8, None),
     "Q4_CR": (gguf.GGMLQuantizationType.I8, None),  # Alias for Q4_CR_W4A4
+    # Experimental ConvRot binary weights with BF16/FP16 activations.
+    "Q1_CR_XL": (gguf.GGMLQuantizationType.I8, None),
     # Q4_PT is retired pending a performant Ampere W4A16 backend.
     # "Q4_PT": (gguf.GGMLQuantizationType.I8, None),
 }
@@ -780,6 +812,8 @@ TARGET_SIZE_Q8_TYPES = ("Q8_CR", "Q8_0")
 DEFAULT_TARGET_SIZE_Q8_TYPE = "Q8_CR"
 Q4_CR_W4A4_CONVROT_GROUP_SIZE = 256
 Q4_CR_W4A4_QUANT_GROUP_SIZE = 64
+Q1_CR_XL_CONVROT_GROUP_SIZE = 256
+Q1_CR_XL_QUANT_GROUP_SIZE = 64
 QUANTIZATION_DEVICE_OPTIONS = ("auto", "cpu", "cuda")
 MEBIBYTE = 1024 * 1024
 K_QUANT_TYPES = frozenset((
@@ -1289,6 +1323,67 @@ def quantize_int4_cr_w4a4(
     return packed, wscales, quant_conf, orig_shape
 
 
+def quantize_int1_cr_xl(
+    weight,
+    convrot_groupsize=Q1_CR_XL_CONVROT_GROUP_SIZE,
+    quant_group_size=Q1_CR_XL_QUANT_GROUP_SIZE,
+    device=None,
+):
+    """Quantize a 2D Linear weight to ConvRot 1-bit signs and FP16 group scales."""
+    from q1_cr_triton_backend import pack_int1_sign_bits
+
+    if device is not None:
+        weight = weight.to(device)
+    if weight.ndim != 2 or not weight.is_floating_point():
+        raise ValueError(
+            f"Q1_CR_XL requires a 2D floating-point Linear weight, got {tuple(weight.shape)}"
+        )
+    if (
+        not isinstance(convrot_groupsize, int)
+        or isinstance(convrot_groupsize, bool)
+        or convrot_groupsize <= 0
+        or not isinstance(quant_group_size, int)
+        or isinstance(quant_group_size, bool)
+        or quant_group_size <= 0
+        or quant_group_size % 8
+    ):
+        raise ValueError(
+            "Q1_CR_XL ConvRot and quantization group sizes must be positive integers, "
+            "and quant_group_size must be divisible by 8."
+        )
+
+    orig_shape = tuple(weight.shape)
+    n, k = orig_shape
+    if k % convrot_groupsize or k % quant_group_size:
+        raise ValueError(
+            f"Q1_CR_XL group sizes {convrot_groupsize}/{quant_group_size} must divide "
+            f"input features {k} for tensor {orig_shape}."
+        )
+    orig_dtype = str(weight.dtype).removeprefix("torch.")
+    weight_f32 = weight.to(torch.float32)
+    hadamard = _build_regular_hadamard(
+        convrot_groupsize,
+        dtype=torch.float32,
+        device=weight.device,
+    )
+    rotated = (
+        weight_f32.reshape(n, k // convrot_groupsize, convrot_groupsize)
+        @ hadamard.T
+    ).reshape(n, k)
+    qdata, scales = pack_int1_sign_bits(rotated, quant_group_size)
+    quant_conf = {
+        "format": "int1_cr",
+        "backing": "w1a16",
+        "linear_dtype": "bf16",
+        "convrot_groupsize": convrot_groupsize,
+        "quant_group_size": quant_group_size,
+        "orig_shape": orig_shape,
+        "orig_dtype": orig_dtype,
+        "weight_rotated": True,
+    }
+    return qdata, scales, quant_conf, orig_shape
+
+
 def _build_regular_hadamard(size, dtype=torch.float32, device="cpu"):
     """Build a normalized regular (Sylvester) Hadamard of a power-of-4 size."""
     if size < 4 or (size & (size - 1)) != 0 or not math.log(size, 4).is_integer():
@@ -1517,7 +1612,7 @@ def parse_args():
         choices=QUANTIZATION_DEVICE_OPTIONS,
         default="auto",
         help=(
-            "Device for Q8_CR and Q4_CR conversion. auto uses CUDA when available; CPU remains "
+            "Device for Q8_CR/Q4_CR/Q1_CR_XL conversion. auto uses CUDA when available; CPU remains "
             "the fallback for individual matrices that cannot fit in available VRAM."
         ),
     )
@@ -1705,6 +1800,12 @@ def handle_tensors(
         q8_cr_patterns = list(model_arch.keys_q8_cr)
         if quant_type_name == "Q4_CR_L":
             q8_cr_patterns.extend(getattr(model_arch, "keys_q8_cr_l", ()))
+        custom_cr_types = {
+            "Q4_CR",
+            "Q4_CR_W4A4",
+            "Q4_CR_L",
+            "Q1_CR_XL",
+        }
 
         apply_quantization_rules = (
             quant_type_name == "Q8_CR"
@@ -1742,7 +1843,7 @@ def handle_tensors(
                 # "last.modulation.lin" needs full F32, even though the
                 # broader "^last." keys_noquant entry also matches it).
                 data_qtype = gguf.GGMLQuantizationType.F32
-            elif key_matches(key, q8_cr_patterns) and quant_type_name in {"Q4_CR", "Q4_CR_W4A4", "Q4_CR_L"}:
+            elif key_matches(key, q8_cr_patterns) and quant_type_name in custom_cr_types:
                 data_qtype = gguf.GGMLQuantizationType.I8
             elif key_matches(key, model_arch.keys_noquant):
                 pass
@@ -1764,11 +1865,10 @@ def handle_tensors(
         # Q4_PT layout restrictions are retained with
         # retired_quantize_int4_pytorch and are intentionally not selectable.
 
-        # Q4_CR_W4A4 and Q4_CR_L only support Linear matrices whose K dimension
-        # is divisible by the ConvRot group size (default 256). Others fall back to F16
-        # to avoid a conversion-time crash on awkward shapes.
+        # ConvRot custom formats only support Linear matrices whose K dimension
+        # is divisible by their ConvRot group size. Other shapes remain F16.
         if (
-            quant_type_name in {"Q4_CR_W4A4", "Q4_CR", "Q4_CR_L"}
+            quant_type_name in custom_cr_types
             and n_dims > 1
             and (
                 n_dims != 2
@@ -1803,7 +1903,7 @@ def handle_tensors(
             and (
                 quant_type_name == "Q8_CR"
                 or (
-                    quant_type_name in {"Q4_CR", "Q4_CR_W4A4", "Q4_CR_L"}
+                    quant_type_name in custom_cr_types
                     and key_matches(key, q8_cr_patterns)
                 )
             )
@@ -1844,6 +1944,58 @@ def handle_tensors(
                 f"{key}_scale",
                 scale.cpu().numpy(),
                 raw_dtype=gguf.GGMLQuantizationType.F32,
+            )
+            writer.add_string(f"comfy.gguf.quant.{key}", json.dumps(quant_conf))
+            if progress_callback is not None:
+                progress_callback("quantize", progress_offset + tensor_index, progress_total or len(state_dict))
+            continue
+
+        # Q1_CR_XL uses packed little-endian sign bits and one FP16 scale per
+        # 64-weight group. The Qwen Image 2.1 architecture keeps attention in
+        # Q8_CR via keys_q8_cr and applies this format to eligible MLP matrices.
+        if (
+            quant_type_name == "Q1_CR_XL"
+            and data_qtype == gguf.GGMLQuantizationType.I8
+            and n_dims == 2
+            and data.shape[1] % Q1_CR_XL_CONVROT_GROUP_SIZE == 0
+            and not key_matches(key, model_arch.keys_hiprec)
+            and not key_matches(key, model_arch.keys_noquant)
+            and not key_matches(key, q8_cr_patterns)
+        ):
+            q1_cr_weight = torch.from_numpy(data)
+            if q4_cr_device is None:
+                q4_cr_device = resolve_quantization_device(quantization_device)
+            device = q4_cr_device
+            try:
+                qdata, scales, quant_conf, _orig_shape = quantize_int1_cr_xl(
+                    q1_cr_weight,
+                    convrot_groupsize=Q1_CR_XL_CONVROT_GROUP_SIZE,
+                    quant_group_size=Q1_CR_XL_QUANT_GROUP_SIZE,
+                    device=device,
+                )
+            except torch.OutOfMemoryError:
+                if device.type != "cuda":
+                    raise
+                torch.cuda.empty_cache()
+                logging.warning(
+                    "Q1_CR_XL CUDA fallback for %s: CUDA ran out of memory while quantizing.",
+                    key,
+                )
+                qdata, scales, quant_conf, _orig_shape = quantize_int1_cr_xl(
+                    q1_cr_weight,
+                    convrot_groupsize=Q1_CR_XL_CONVROT_GROUP_SIZE,
+                    quant_group_size=Q1_CR_XL_QUANT_GROUP_SIZE,
+                    device=torch.device("cpu"),
+                )
+            writer.add_tensor(
+                key,
+                qdata.cpu().numpy(),
+                raw_dtype=gguf.GGMLQuantizationType.I8,
+            )
+            writer.add_tensor(
+                f"{key}_scale",
+                scales.cpu().numpy(),
+                raw_dtype=gguf.GGMLQuantizationType.F16,
             )
             writer.add_string(f"comfy.gguf.quant.{key}", json.dumps(quant_conf))
             if progress_callback is not None:

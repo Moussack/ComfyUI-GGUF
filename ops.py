@@ -766,6 +766,7 @@ def get_gguf_q4_w4a4_ops(
                 self._orig_shape = (out_features, in_features)
                 self._convrot_groupsize = 256
                 self._quant_group_size = 64
+                self._quantized_format = None
                 self._quantized = False
                 self.weight_scale = None
                 self._compute_dtype = compute_dtype
@@ -828,15 +829,16 @@ def get_gguf_q4_w4a4_ops(
                         requires_grad=False,
                     )
                     self._quantized = False
+                    self._quantized_format = None
                     return
 
                 if scale is None:
-                    raise RuntimeError(f"Missing Q4_CR scale tensor for {prefix}")
+                    raise RuntimeError(f"Missing ConvRot scale tensor for {prefix}")
 
                 quant_conf = json.loads(bytes(quant_raw.tolist()).decode("utf-8"))
                 if quant_conf.get("format") == "int8_tensorwise":
-                    # Mixed Q4_CR files may store selected layers as Q8_CR.
-                    # This Q4 operator cannot dispatch TensorWiseINT8 directly,
+                    # Mixed custom ConvRot files may store selected layers as Q8_CR.
+                    # This operator cannot dispatch TensorWiseINT8 directly,
                     # so materialize those layers safely instead of rejecting the
                     # whole model. A native mixed backend can replace this fallback.
                     if weight.ndim != 2 or scale.numel() != weight.shape[0]:
@@ -863,6 +865,52 @@ def get_gguf_q4_w4a4_ops(
                         requires_grad=False,
                     )
                     self._quantized = False
+                    self._quantized_format = None
+                    return
+                if quant_conf.get("format") == "int1_cr":
+                    orig_shape = tuple(quant_conf.get("orig_shape", ()))
+                    convrot_groupsize = quant_conf.get("convrot_groupsize")
+                    quant_group_size = quant_conf.get("quant_group_size")
+                    if (
+                        quant_conf.get("backing") != "w1a16"
+                        or quant_conf.get("linear_dtype") != "bf16"
+                        or quant_conf.get("weight_rotated") is not True
+                        or len(orig_shape) != 2
+                        or not all(
+                            isinstance(dim, int) and not isinstance(dim, bool) and dim > 0
+                            for dim in orig_shape
+                        )
+                        or convrot_groupsize != 256
+                        or quant_group_size != 64
+                        or orig_shape[1] % convrot_groupsize
+                        or orig_shape[1] % quant_group_size
+                        or weight.ndim != 2
+                        or tuple(weight.shape) != (orig_shape[0], orig_shape[1] // 8)
+                        or scale.ndim != 2
+                        or tuple(scale.shape) != (
+                            orig_shape[0],
+                            orig_shape[1] // quant_group_size,
+                        )
+                    ):
+                        raise ValueError(f"Invalid Q1_CR_XL metadata or packed tensors for {prefix}")
+
+                    self.out_features, self.in_features = orig_shape
+                    self._orig_shape = orig_shape
+                    self._convrot_groupsize = convrot_groupsize
+                    self._quant_group_size = quant_group_size
+                    self._quantized_format = "int1_cr"
+                    self.weight = torch.nn.Parameter(weight, requires_grad=False)
+                    self.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
+                    self._quantized = True
+                    self._compute_dtype = compute_dtype or torch.bfloat16
+                    self._quantized_weight = None
+                    self._quantized_weight_device = None
+                    self._fused_weight = None
+                    self._fused_patch_id = None
+                    self._fused_weight_device = None
+                    self._fused_bias = None
+                    self._fused_bias_patch_id = None
+                    self._fused_bias_device = None
                     return
                 backing = quant_conf.get("backing")
                 if quant_conf.get("format") != "int4_cr" or backing not in {"w4a4", "w4a8"}:
@@ -880,6 +928,7 @@ def get_gguf_q4_w4a4_ops(
                         f"requires {expected_linear_dtype!r}, got {linear_dtype!r}"
                     )
                 self._default_linear_dtype = linear_dtype
+                self._quantized_format = "int4_cr"
                 self._convrot_groupsize = quant_conf.get("convrot_groupsize", 256)
                 self._quant_group_size = quant_conf.get("quant_group_size", 64)
                 self._orig_shape = tuple(quant_conf.get("orig_shape", (self.out_features, self.in_features)))
@@ -1132,7 +1181,7 @@ def get_gguf_q4_w4a4_ops(
                                 raise
                             self._move_derived_caches_to_cpu()
                             logging.warning(
-                                "Q4_CR CUDA fallback for INT4 adapter layer: "
+                                "Custom ConvRot CUDA fallback for adapter layer: "
                                 "CUDA ran out of memory while preparing the patched weight."
                             )
                             fused = self._get_cached_fused_weight(torch.device("cpu")) is not None
@@ -1300,6 +1349,80 @@ def get_gguf_q4_w4a4_ops(
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
+            def _q1_cr_xl_linear(self, input, bias):
+                from .q1_cr_triton_backend import q1_cr_xl_linear
+
+                return q1_cr_xl_linear(
+                    input,
+                    self.weight,
+                    self.weight_scale,
+                    bias=bias,
+                    orig_shape=self._orig_shape,
+                    convrot_group_size=self._convrot_groupsize,
+                    quant_group_size=self._quant_group_size,
+                )
+
+            def _forward_q1_cr_xl(self, input, bias, has_weight_functions):
+                if has_weight_functions:
+                    native_entries = self._native_lora_patch_entries()
+                    if native_entries is not None:
+                        try:
+                            base_out = self._q1_cr_xl_linear(input, bias)
+                        except torch.OutOfMemoryError:
+                            if input.device.type != "cuda":
+                                raise
+                            logging.warning(
+                                "Q1_CR_XL CUDA fallback: out of memory during W1A16 execution; "
+                                "retrying this layer in system memory."
+                            )
+                            return self._cpu_forward_fallback(
+                                input,
+                                bias,
+                                native_entries=native_entries,
+                            )
+                        if not native_entries:
+                            return base_out
+                        bypass_out = self._native_lora_bypass(input, base_out)
+                        if bypass_out is not None:
+                            return bypass_out
+
+                    try:
+                        fused_weight = self._get_cached_fused_weight(input.device)
+                        if fused_weight.device.type == "cpu" and input.device.type == "cuda":
+                            return self._cpu_forward_fallback(
+                                input,
+                                bias,
+                                use_fused_weight=True,
+                            )
+                        return torch.nn.functional.linear(
+                            input,
+                            fused_weight.to(device=input.device, dtype=input.dtype),
+                            bias,
+                        )
+                    except torch.OutOfMemoryError:
+                        if input.device.type != "cuda":
+                            raise
+                        logging.warning(
+                            "Q1_CR_XL CUDA fallback: out of memory while preparing patched weights; "
+                            "retrying this layer in system memory."
+                        )
+                        return self._cpu_forward_fallback(
+                            input,
+                            bias,
+                            use_fused_weight=True,
+                        )
+
+                try:
+                    return self._q1_cr_xl_linear(input, bias)
+                except torch.OutOfMemoryError:
+                    if input.device.type != "cuda":
+                        raise
+                    logging.warning(
+                        "Q1_CR_XL CUDA fallback: out of memory during W1A16 execution; "
+                        "retrying this layer in system memory."
+                    )
+                    return self._cpu_forward_fallback(input, bias)
+
             def _cpu_forward_fallback(self, input, bias, native_entries=None, use_fused_weight=False):
                 """Run one failed INT4 layer through CPU system memory."""
                 original_device = input.device
@@ -1356,6 +1479,12 @@ def get_gguf_q4_w4a4_ops(
                         for f in getattr(self, "weight_function", ()):
                             weight = f(weight)
                     return torch.nn.functional.linear(input, weight, bias)
+                if self._quantized_format == "int1_cr":
+                    return self._forward_q1_cr_xl(
+                        input,
+                        bias,
+                        has_weight_functions,
+                    )
                 if self._default_linear_dtype == "int8" and input.device.type != "cuda":
                     warn_w4a8_dense_fallback()
                     # The eager ConvRot W4A4 implementation accepts the int8
@@ -1400,7 +1529,7 @@ def get_gguf_q4_w4a4_ops(
                             if input.device.type != "cuda":
                                 raise
                             logging.warning(
-                                "Q4_CR CUDA fallback for INT4 adapter layer: "
+                                "Custom ConvRot CUDA fallback for adapter layer: "
                                 "CUDA ran out of memory; retrying this layer in system memory."
                             )
                             return self._cpu_forward_fallback(
@@ -1434,7 +1563,7 @@ def get_gguf_q4_w4a4_ops(
                                 del base_out
                                 del weight_qt
                                 logging.warning(
-                                    "Q4_CR CUDA fallback for INT4 adapter layer: "
+                                    "Custom ConvRot CUDA fallback for adapter layer: "
                                     "CUDA ran out of memory; retrying this layer in system memory."
                                 )
                                 return self._cpu_forward_fallback(
@@ -1446,7 +1575,7 @@ def get_gguf_q4_w4a4_ops(
                             if input.device.type != "cuda":
                                 raise
                             logging.warning(
-                                "Q4_CR CUDA fallback for INT4 adapter layer: "
+                                "Custom ConvRot CUDA fallback for adapter layer: "
                                 "CUDA ran out of memory; retrying this layer in system memory."
                             )
                             return self._cpu_forward_fallback(input, bias, use_fused_weight=True)
@@ -1465,7 +1594,7 @@ def get_gguf_q4_w4a4_ops(
                                 raise
                             del fused_weight
                             logging.warning(
-                                "Q4_CR CUDA fallback for INT4 adapter layer: "
+                                "Custom ConvRot CUDA fallback for adapter layer: "
                                 "CUDA ran out of memory; retrying this layer in system memory."
                             )
                             return self._cpu_forward_fallback(input, bias, use_fused_weight=True)
@@ -1495,7 +1624,7 @@ def get_gguf_q4_w4a4_ops(
                     if input.device.type != "cuda":
                         raise
                     logging.warning(
-                        "Q4_CR CUDA fallback for INT4 layer: "
+                        "Custom ConvRot CUDA fallback for quantized layer: "
                         "CUDA ran out of memory; retrying this layer in system memory."
                     )
                     return self._cpu_forward_fallback(input, bias)
@@ -1514,7 +1643,9 @@ def get_gguf_q4_w4a4_ops(
                     )
 
                 perf_mode = (
-                    "int4_convrot_w4a8"
+                    "int1_convrot_w1a16"
+                    if getattr(self, "_quantized_format", None) == "int1_cr"
+                    else "int4_convrot_w4a8"
                     if self._default_linear_dtype == "int8"
                     else "int4_convrot_w4a4"
                 )
@@ -1522,6 +1653,17 @@ def get_gguf_q4_w4a4_ops(
 
             def _dequantized_weight(self, device, dtype):
                 packed = self.weight.to(device=device).to(torch.int8)
+                if self._quantized_format == "int1_cr":
+                    from .q1_cr_triton_backend import dequantize_q1_cr_xl_weight
+
+                    return dequantize_q1_cr_xl_weight(
+                        packed,
+                        self.weight_scale.to(device=device),
+                        self._orig_shape,
+                        dtype=dtype,
+                        convrot_group_size=self._convrot_groupsize,
+                        quant_group_size=self._quant_group_size,
+                    )
                 scale = self.weight_scale.to(device=device, dtype=dtype)
                 n, k_half = packed.shape
                 k = k_half * 2

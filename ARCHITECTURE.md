@@ -59,6 +59,28 @@ materialized safely by the Q4 operator, and loader mode selection prioritizes
 the Q4 backing when both custom formats are present. Unsupported or malformed
 backings are rejected rather than interpreted as another format.
 
+## Experimental Q1_CR_XL (W1A16)
+
+`Q1_CR_XL` stores a 2D Linear matrix as little-endian packed sign bits
+`[N, K // 8]` in GGUF `I8`, plus FP16 binary scales `[N, K // 64]`. Before
+packing, each 256-column block is multiplied by the regular normalized
+Hadamard matrix; each 64-weight group's scale is the mean absolute rotated
+weight, the least-squares optimal scale for fixed `{-1, +1}` values. The
+format metadata records the original dimensions, `backing="w1a16"`, and
+`linear_dtype="bf16"`.
+
+The experimental runtime rotates activations online, uses a Triton kernel to
+decode the sign bits and group scales into a temporary BF16 weight matrix, then
+calls PyTorch/cuBLAS Linear. This is not native binary TensorCore inference:
+the temporary dense matrix raises peak memory during a layer call and the
+prototype fused Triton GEMM was not fast enough to enable by default. Standard
+LoRA/LoKr patches use a low-rank output correction; unsupported patch types use
+the existing fused dense-weight fallback. Qwen Image 2.1 keeps conditioning,
+normalization, input/output, and attention weights at higher precision
+(attention uses `Q8_CR`) and applies `Q1_CR_XL` to eligible image MLP matrices.
+This format is experimental; validate output quality, peak VRAM, and latency
+on the target GPU before using it for production conversions.
+
 ## Experimental Accelerated GGML K-Quant Linear
 
 Standard `Q3_K`, `Q4_K`, `Q5_K`, and `Q6_K` tensors retain their packed GGUF

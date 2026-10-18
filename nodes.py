@@ -171,7 +171,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         weight = comfy.utils.get_attr(self.model, key)
 
         patches = self.patches[key]
-        # Legacy Q4_CR (INT4) paths: the base weight stays packed (plain
+        # Legacy custom ConvRot paths: the base weight stays packed (plain
         # Parameter) and adapters run through the module's weight_function
         # (native low-rank bypass or fused fallback). Fusing directly with
         # calculate_weight here would corrupt the packed INT4 bytes.
@@ -188,7 +188,7 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
                 out_weight = weight.to(device_to)
                 patches = move_patch_to_device(patches, self.load_device if self.patch_on_device else self.offload_device)
                 install_patch(patches, key)
-                logging.warning(f"Q4_CR INT4 GGUF is best used with the f{UnetLoaderGGUFDynamicVRAM.TITLE} loader node, because using it with Legacy VRAM is much slower.")
+                logging.warning(f"Custom ConvRot quantized GGUF is best used with the f{UnetLoaderGGUFDynamicVRAM.TITLE} loader node, because using it with Legacy VRAM is much slower.")
                 if inplace_update:
                     comfy.utils.copy_to_param(self.model, key, out_weight)
                 else:
@@ -863,6 +863,8 @@ def _legacy_gguf_ops(extra, compute_dtype=None):
             compute_dtype=compute_dtype,
             default_linear_dtype="int8",
         )()
+    if mode == "int1_cr_xl":
+        return get_gguf_q4_w4a4_ops(compute_dtype=compute_dtype)()
     return GGMLOps()
 
 

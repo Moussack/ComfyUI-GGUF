@@ -227,7 +227,7 @@ FORM: Operate-mode workbench, optimized for repeatable local conversion and long
   <main class="shell">
     <header class="hero">
       <div class="hero-copy">
-        <h1 style="background:linear-gradient(120deg, #10b0a3, #4f7cff); background-clip: text; color: transparent; ;">GGUF conversion dashboard</h1>
+        <h1>GGUF conversion dashboard</h1>
         <p>Convert local safetensors checkpoints to GGUF locally. Your jobs run one at a time, and the model files stay on this machine.</p>
       </div>
       <div class="hero-links" aria-label="Conversion help">
@@ -263,6 +263,7 @@ FORM: Operate-mode workbench, optimized for repeatable local conversion and long
                 <label class="quant-option"><input type="checkbox" name="quant_type" value="Q8_CR" checked><span class="quant-top"><span class="quant-name">Q8_CR</span><span class="quant-badge proprietary">Proprietary</span></span><span class="quant-note">Native INT8 path</span></label>
                 <label class="quant-option"><input type="checkbox" name="quant_type" value="Q4_CR"><span class="quant-top"><span class="quant-name">Q4_CR</span><span class="quant-badge proprietary">Proprietary</span></span><span class="quant-note">INT4 W4A4 · ConvRot</span></label>
                 <label class="quant-option"><input type="checkbox" name="quant_type" value="Q4_CR_L"><span class="quant-top"><span class="quant-name">Q4_CR_L</span><span class="quant-badge proprietary">Proprietary</span></span><span class="quant-note">INT4 W4A8 · ConvRot</span></label>
+                <label class="quant-option"><input type="checkbox" name="quant_type" value="Q1_CR_XL"><span class="quant-top"><span class="quant-name">Q1_CR_XL</span><span class="quant-badge proprietary">Experimental</span></span><span class="quant-note">1-bit W1A16 · ConvRot</span></label>
                 <label class="quant-option"><input type="checkbox" name="quant_type" value="Q8_0"><span class="quant-top"><span class="quant-name">Q8_0</span><span class="quant-badge standard">Standard</span></span><span class="quant-note">Standard 8-bit</span></label>
                 <label class="quant-option"><input type="checkbox" name="quant_type" value="Q6_K"><span class="quant-top"><span class="quant-name">Q6_K</span><span class="quant-badge standard">Standard</span></span><span class="quant-note">Uniform 6-bit K</span></label>
                 <label class="quant-option"><input type="checkbox" name="quant_type" value="Q5_K"><span class="quant-top"><span class="quant-name">Q5_K</span><span class="quant-badge standard">Standard</span></span><span class="quant-note">Uniform 5-bit K</span></label>
@@ -278,7 +279,7 @@ FORM: Operate-mode workbench, optimized for repeatable local conversion and long
                 <label class="quant-option"><input type="checkbox" name="quant_type" value="source"><span class="quant-top"><span class="quant-name">Source</span><span class="quant-badge standard">Standard</span></span><span class="quant-note">Preserve F16 or BF16</span></label>
               </div>
               <p class="hint"><span id="quant-selection-note">1 format selected (Q8_CR). Select multiple formats to queue a batch.</span> See <a href="https://molbal.github.io/gguf/ecosystem/quant-formats.html#standard-formats" target="_blank" rel="noopener noreferrer">standard formats</a> and <a href="https://molbal.github.io/gguf/ecosystem/quant-formats.html#custom-formats" target="_blank" rel="noopener noreferrer">custom formats</a>.</p>
-              <template id="quant-compatibility"><select><option value="Q4_CR_W4A4">Q4_CR_W4A4</option><option value="Q4_CR_L">Q4_CR_L</option></select></template>
+              <template id="quant-compatibility"><select><option value="Q4_CR_W4A4">Q4_CR_W4A4</option><option value="Q4_CR_L">Q4_CR_L</option><option value="Q1_CR_XL">Q1_CR_XL</option></select></template>
             </fieldset>
             <div class="field hidden" id="target-field">
               <label for="target-size">Target size (MiB)</label>
@@ -381,7 +382,7 @@ FORM: Operate-mode workbench, optimized for repeatable local conversion and long
     const jobDialog = document.querySelector("#job-dialog");
     const HISTORY_KEY = "gguf_conversion_jobs_v1";
     const MAX_LOG_CHARS = 40000;
-    const quantPostfixes = ["Q4_CR_W4A4", "Q4_CR_L", "Q4_CR", "Q8_CR", "Q8_0", "Q6_K", "Q5_K_M", "Q5_K_S", "Q5_K", "Q4_K_M", "Q4_K_S", "Q4_K", "Q5_1", "Q5_0", "Q4_1", "Q4_0", "TARGET_SIZE", "BF16", "F16", "source"];
+    const quantPostfixes = ["Q4_CR_W4A4", "Q1_CR_XL", "Q4_CR_L", "Q4_CR", "Q8_CR", "Q8_0", "Q6_K", "Q5_K_M", "Q5_K_S", "Q5_K", "Q4_K_M", "Q4_K_S", "Q4_K", "Q5_1", "Q5_0", "Q4_1", "Q4_0", "TARGET_SIZE", "BF16", "F16", "source"];
     let cachedJobs = readHistory();
     let activeModalJobId = null;
     let destinationAuto = false;
