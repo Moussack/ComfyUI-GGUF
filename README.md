@@ -42,6 +42,7 @@ Pre-quantized models (🍴 icon on ones added by this fork):
 - [Qwen Image 2.1](https://huggingface.co/molbal/Qwen-Image-2.1-GGUF) 🍴  
 - [Flux3 Klein](https://huggingface.co/molbal/Flux-3-Klein-GGUF) 🍴  
 - [Moss Image](https://huggingface.co/molbal/MOSS-Image-GGUF) 🍴  
+- [Fibo 2.0](https://huggingface.co/molbal/fibo-2.0-GGUF) 🍴  
 
 
 Support for quantizing T5 has also been added, these can be used using the various `*CLIPLoader (GGUF)` nodes which can be used inplace of the regular ones. For the CLIP model, use whatever model you were using before for CLIP. The loader can handle both types of files - `gguf` and regular `safetensors`/`bin`.  
