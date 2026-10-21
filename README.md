@@ -54,7 +54,7 @@ Support for quantizing T5 has also been added, these can be used using the vario
 - [Gemma 4 GGUF](https://huggingface.co/unsloth/gemma-4-E4B-it-qat-GGUF) text encoders (E2B, E4B, 12B, and 31B) with ComfyUI v0.30.0 or later. 🍴
 
 
-## Converting Models (Fibo 2.0, Krea 2, Ideogram 4, MiniMax H3, MiniMax Music 3, MOSS-Image SFT, Qwen Image 2.1, Qwen3-VL 4B)
+## Converting Models
 
 Fibo 2.0 Dev and Edit Turbo BF16 checkpoints are recognized using their
 repacked ComfyUI tensor layout. For example, convert either checkpoint with:
@@ -64,23 +64,6 @@ python tools\convert.py --src "$env:USERPROFILE\Models\fibo2_dev_bf16.safetensor
 python tools\convert.py --src "$env:USERPROFILE\Models\fibo2_edit_turbo_bf16.safetensors" --streamed --quant-type Q4_0
 ```
 
-Fibo 2.0 loading requires ComfyUI core commit
-[`87ed5a06`](https://github.com/Comfy-Org/ComfyUI/commit/87ed5a066d9c4660ef42100fd01a888da6994856)
-or later, which adds the Fibo2 detector and runtime. A ComfyUI installation
-without that commit cannot load the converted diffusion model. GGUF conversion
-support does not establish end-to-end model support: real ComfyUI loading and
-inference still need validation. The text encoder and VAE are loaded separately.
-For K-quant formats, the 128-wide `x_embedder.weight` stays at source precision
-because its row width is smaller than the 256-value K-quant block size.
-The weights are licensed CC BY-NC 4.0; commercial use requires a separate
-agreement with Bria.
-
-MOSS-Image SFT BF16 diffusion checkpoints are detected as `moss_image` and can
-be converted with the regular converter, for example:
-
-```powershell
-python tools\convert.py --src "D:\Models\moss_image_sft_bf16.safetensors" --streamed
-```
 
 `--streamed` converts one safetensors tensor at a time, reducing peak host RAM
 for this large checkpoint. The GGUF contains only the diffusion transformer;
