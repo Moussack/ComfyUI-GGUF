@@ -364,7 +364,7 @@ class UnetLoaderGGUF:
             logging.error("ERROR UNSUPPORTED UNET {}".format(unet_path))
             raise RuntimeError("ERROR: Could not detect model type of: {}".format(unet_path))
         model = GGUFModelPatcher.clone(model)
-        _apply_qwen_image21_fp16_fallback(model, fallback_dtype)
+        _apply_qwen_image21_fp16_fallback(model, fallback_dtype, extra.get("arch_str"))
         model.patch_on_device = patch_on_device
         return (model,)
 
@@ -782,8 +782,17 @@ def _clone_as_dynamic_gguf_patcher(model_patcher):
     return cloned
 
 
+# Architectures that fall back to FP16 on devices without native BF16 (e.g.
+# Turing / RTX 20-series) instead of the much slower FP32 path.
+_FP16_FALLBACK_ARCHS = {
+    "qwen_image21": "Qwen-Image 2.1",
+    "moss_image": "MOSS-Image",
+    "fibo2": "Fibo 2.0",
+}
+
+
 def _qwen_image21_fp16_fallback_dtype(extra):
-    if extra.get("arch_str") != "qwen_image21" or device_supports_bf16():
+    if extra.get("arch_str") not in _FP16_FALLBACK_ARCHS or device_supports_bf16():
         return None
     if getattr(comfy.model_management, "FORCE_FP32", False):
         return None
@@ -821,14 +830,15 @@ def _qwen_image21_fp16_fallback_dtype(extra):
     return torch.float16
 
 
-def _apply_qwen_image21_fp16_fallback(model, fallback_dtype):
+def _apply_qwen_image21_fp16_fallback(model, fallback_dtype, arch_str="qwen_image21"):
     if fallback_dtype is None:
         return
+    label = _FP16_FALLBACK_ARCHS.get(arch_str, arch_str)
 
     base_model = getattr(model, "model", None)
     if base_model is None:
         raise RuntimeError(
-            "Could not configure Qwen-Image 2.1 GGUF FP16 fallback: "
+            f"Could not configure {label} GGUF FP16 fallback: "
             "ComfyUI returned a model patcher without its base model."
         )
 
@@ -838,10 +848,11 @@ def _apply_qwen_image21_fp16_fallback(model, fallback_dtype):
         model_config.manual_cast_dtype = fallback_dtype
 
     logging.warning(
-        "Qwen-Image 2.1 GGUF: using FP16 inference because the active device "
+        "%s GGUF: using FP16 inference because the active device "
         "does not support BF16. ComfyUI currently does not list FP16 as a "
         "supported inference dtype for this architecture; numerical stability "
-        "is not guaranteed."
+        "is not guaranteed.",
+        label,
     )
 
 
@@ -904,7 +915,7 @@ def _load_dynamic_gguf_unet(unet_path, disable_dynamic=False, progress=None):
         logging.error("ERROR UNSUPPORTED UNET {}".format(unet_path))
         raise RuntimeError("ERROR: Could not detect model type of: {}".format(unet_path))
     model = GGUFModelPatcher.clone(model) if disable_dynamic else _clone_as_dynamic_gguf_patcher(model)
-    _apply_qwen_image21_fp16_fallback(model, fallback_dtype)
+    _apply_qwen_image21_fp16_fallback(model, fallback_dtype, extra.get("arch_str"))
     model.cached_patcher_init = (_load_dynamic_gguf_unet, (unet_path,))
     return model
 

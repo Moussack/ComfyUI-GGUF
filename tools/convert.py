@@ -365,6 +365,59 @@ class ModelKrea2(ModelTemplate):
     ]
 
 
+class ModelFibo2(ModelTemplate):
+    """
+    Fibo 2.0 (Bria): 8B single-stream DiT in the FLUX.2 latent space, with a
+    Perceiver resampler and cross-attention "injection" blocks. Reuses the
+    Z-Image/Lumina block layout.
+
+    Key layout (ComfyUI "repacked" file, as read by comfy/ldm/fibo2/model.py):
+      x_embedder.*                               -- latent -> hidden input projection
+      t_embedder.mlp.*                           -- timestep MLP
+      noise_refiner.N.*  / layers.N.*            -- Z-Image style blocks:
+        attention.{qkv,out,q_norm,k_norm}.weight
+        feed_forward.{w13|w1,w3}.weight, feed_forward.w2.weight
+        {attention,ffn}_norm{1,2}.weight, adaLN_modulation.0.{weight,bias}
+        cross_attention.*, cross_attn_norm{1,2}.*, cross_attn_gate  (injection layers only)
+      perceiver.latent_queries                   -- bare 2D nn.Parameter (no ".weight")
+      perceiver.layers.N.*, perceiver.norm_out.weight
+      final_layer.{linear,adaLN_modulation}.*
+
+    Detection mirrors comfy/model_detection.py (perceiver.latent_queries +
+    layers.0.attention.qkv.weight + final_layer.linear.weight + a fused w13 or
+    split w1 feed-forward). The original Diffusers checkpoint uses different key
+    names and is NOT detected; convert the ComfyUI-repacked file.
+    NOTE: ComfyUI core must include Fibo 2.0 support (Comfy-Org/ComfyUI#17240).
+    """
+    arch = "fibo2"
+    keys_detect = [
+        (
+            "perceiver.latent_queries",
+            "layers.0.attention.qkv.weight",
+            "final_layer.linear.weight",
+            "layers.0.feed_forward.w13.weight",
+        ),
+        (
+            "perceiver.latent_queries",
+            "layers.0.attention.qkv.weight",
+            "final_layer.linear.weight",
+            "layers.0.feed_forward.w1.weight",
+        ),
+    ]
+    # perceiver.latent_queries is a bare 2D parameter that the model slices at
+    # runtime ([:num_gist]); the converter would otherwise quantize it because it
+    # only looks at rank and size, not the ".weight" suffix. The input/output
+    # projections and the timestep/modulation conditioning feed every block, so
+    # keep them at source precision. The block weights hold nearly all params.
+    keys_noquant = [
+        "^perceiver.latent_queries",
+        "^x_embedder.",
+        "^t_embedder.",
+        "^final_layer.",
+        "adaLN_modulation.",
+    ]
+
+
 class ModelMinimaxH3(ModelTemplate):
     arch = "minimax_h3"
     keys_detect = [
@@ -556,7 +609,7 @@ arch_list = [ModelFlux, ModelFlux3, ModelSD3, ModelAura, ModelHiDream, CosmosPre
              ModelLTXV, ModelLTXVUpsampler, ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2,
              ModelKrea2, ModelIdeogram, ModelMinimaxH3, ModelMinimaxH3VAE,
              ModelMiniMaxMusic3DiT, ModelMiniMaxMusic3TextEncoder, ModelQwen3, ModelQwen3VL,
-             ModelQwenImage21, ModelMOSSImage]
+             ModelQwenImage21, ModelMOSSImage, ModelFibo2]
 
 QWEN3_HF_KEY_MAP = {
     "embed_tokens.weight": "token_embd.weight",
