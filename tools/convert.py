@@ -552,11 +552,32 @@ class ModelMOSSImage(ModelTemplate):
     keys_ignore = ["^rope.bands"]
 
 
+class ModelFibo2(ModelTemplate):
+    arch = "fibo2"
+    keys_detect = [
+        (
+            "perceiver.latent_queries",
+            "layers.0.attention.qkv.weight",
+            "layers.0.feed_forward.w13.weight",
+            "final_layer.linear.weight",
+        )
+    ]
+    # These are learned queries rather than Linear weights, and Fibo's
+    # reference quantized export keeps AdaLN modulation projections in BF16.
+    keys_noquant = [
+        "^perceiver.latent_queries",
+        "adaLN_modulation",
+    ]
+    # The 128-wide input projection cannot be represented by 256-value K-quant
+    # rows; retain source precision for K quants while allowing other formats.
+    keys_k_noquant = ["^x_embedder.weight"]
+
+
 arch_list = [ModelFlux, ModelFlux3, ModelSD3, ModelAura, ModelHiDream, CosmosPredict2,
              ModelLTXV, ModelLTXVUpsampler, ModelHyVid, ModelWan, ModelSDXL, ModelSD1, ModelLumina2,
              ModelKrea2, ModelIdeogram, ModelMinimaxH3, ModelMinimaxH3VAE,
              ModelMiniMaxMusic3DiT, ModelMiniMaxMusic3TextEncoder, ModelQwen3, ModelQwen3VL,
-             ModelQwenImage21, ModelMOSSImage]
+             ModelQwenImage21, ModelMOSSImage, ModelFibo2]
 
 QWEN3_HF_KEY_MAP = {
     "embed_tokens.weight": "token_embd.weight",
