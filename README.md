@@ -42,6 +42,7 @@ Pre-quantized models (🍴 icon on ones added by this fork):
 - [Qwen Image 2.1](https://huggingface.co/molbal/Qwen-Image-2.1-GGUF) 🍴  
 - [Flux3 Klein](https://huggingface.co/molbal/Flux-3-Klein-GGUF) 🍴  
 - [Moss Image](https://huggingface.co/molbal/MOSS-Image-GGUF) 🍴  
+- [Fibo 2.0](https://huggingface.co/molbal/fibo-2.0-GGUF) 🍴  
 
 
 Support for quantizing T5 has also been added, these can be used using the various `*CLIPLoader (GGUF)` nodes which can be used inplace of the regular ones. For the CLIP model, use whatever model you were using before for CLIP. The loader can handle both types of files - `gguf` and regular `safetensors`/`bin`.  
@@ -54,14 +55,16 @@ Support for quantizing T5 has also been added, these can be used using the vario
 - [Gemma 4 GGUF](https://huggingface.co/unsloth/gemma-4-E4B-it-qat-GGUF) text encoders (E2B, E4B, 12B, and 31B) with ComfyUI v0.30.0 or later. 🍴
 
 
-## Converting Models (Krea 2, Ideogram 4, MiniMax H3, MiniMax Music 3, MOSS-Image SFT, Qwen Image 2.1, Qwen3-VL 4B)
+## Converting Models
 
-MOSS-Image SFT BF16 diffusion checkpoints are detected as `moss_image` and can
-be converted with the regular converter, for example:
+Fibo 2.0 Dev and Edit Turbo BF16 checkpoints are recognized using their
+repacked ComfyUI tensor layout. For example, convert either checkpoint with:
 
 ```powershell
-python tools\convert.py --src "D:\Models\moss_image_sft_bf16.safetensors" --streamed
+python tools\convert.py --src "$env:USERPROFILE\Models\fibo2_dev_bf16.safetensors" --streamed --quant-type Q4_0
+python tools\convert.py --src "$env:USERPROFILE\Models\fibo2_edit_turbo_bf16.safetensors" --streamed --quant-type Q4_0
 ```
+
 
 `--streamed` converts one safetensors tensor at a time, reducing peak host RAM
 for this large checkpoint. The GGUF contains only the diffusion transformer;

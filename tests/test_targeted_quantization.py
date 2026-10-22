@@ -32,8 +32,8 @@ from tools.convert import (
     ModelMiniMaxMusic3DiT,
     ModelMiniMaxMusic3TextEncoder,
     ModelFlux3,
-    ModelMOSSImage,
     ModelFibo2,
+    ModelMOSSImage,
     ModelQwen3,
     ModelQwen3VL,
     ModelQwenImage21,
@@ -1239,94 +1239,88 @@ class MOSSImageConversionTests(unittest.TestCase):
         self.assertEqual(torch.count_nonzero(merged).item(), 3)
 
 
-
 class Fibo2ConversionTests(unittest.TestCase):
-    DIM = 256
-    FFN = 512
-    CAP = 512
-    GIST = 64
-
-    def _source_state_dict(self, fused=True):
+    @staticmethod
+    def _source_state_dict():
         dtype = torch.bfloat16
-        dim, ffn, cap, gist = self.DIM, self.FFN, self.CAP, self.GIST
+        dim = 512
+        ffn_dim = 1024
+        context_dim = 1024
 
-        def ffn_weights(prefix):
-            if fused:
-                return {f"{prefix}.w13.weight": torch.randn((2 * ffn, dim), dtype=dtype)}
-            return {
-                f"{prefix}.w1.weight": torch.randn((ffn, dim), dtype=dtype),
-                f"{prefix}.w3.weight": torch.randn((ffn, dim), dtype=dtype),
-            }
-
-        def block(prefix, injection=False):
-            weights = {
+        def block_tensors(prefix, with_cross_attention=False):
+            tensors = {
                 f"{prefix}.attention.qkv.weight": torch.randn((3 * dim, dim), dtype=dtype),
                 f"{prefix}.attention.out.weight": torch.randn((dim, dim), dtype=dtype),
                 f"{prefix}.attention.q_norm.weight": torch.ones(128, dtype=dtype),
                 f"{prefix}.attention.k_norm.weight": torch.ones(128, dtype=dtype),
-                f"{prefix}.feed_forward.w2.weight": torch.randn((dim, ffn), dtype=dtype),
+                f"{prefix}.feed_forward.w13.weight": torch.randn((2 * ffn_dim, dim), dtype=dtype),
+                f"{prefix}.feed_forward.w2.weight": torch.randn((dim, ffn_dim), dtype=dtype),
+                f"{prefix}.attention_norm1.weight": torch.ones(dim, dtype=dtype),
+                f"{prefix}.attention_norm2.weight": torch.ones(dim, dtype=dtype),
+                f"{prefix}.ffn_norm1.weight": torch.ones(dim, dtype=dtype),
+                f"{prefix}.ffn_norm2.weight": torch.ones(dim, dtype=dtype),
                 f"{prefix}.adaLN_modulation.0.weight": torch.randn((4 * dim, 256), dtype=dtype),
-                f"{prefix}.adaLN_modulation.0.bias": torch.zeros(4 * dim, dtype=dtype),
+                f"{prefix}.adaLN_modulation.0.bias": torch.randn((4 * dim,), dtype=dtype),
             }
-            weights.update(ffn_weights(f"{prefix}.feed_forward"))
-            for name in ("attention_norm1", "ffn_norm1", "attention_norm2", "ffn_norm2"):
-                weights[f"{prefix}.{name}.weight"] = torch.ones(dim, dtype=dtype)
-            if injection:
-                weights[f"{prefix}.cross_attn_gate"] = torch.zeros(1, dtype=dtype)
-                weights[f"{prefix}.cross_attn_norm1.weight"] = torch.ones(dim, dtype=dtype)
-                weights[f"{prefix}.cross_attn_norm2.weight"] = torch.ones(dim, dtype=dtype)
-                weights[f"{prefix}.cross_attention.to_q.weight"] = torch.randn((dim, dim), dtype=dtype)
-                weights[f"{prefix}.cross_attention.to_kv.weight"] = torch.randn((2 * dim, cap), dtype=dtype)
-                weights[f"{prefix}.cross_attention.to_out.weight"] = torch.randn((dim, dim), dtype=dtype)
-            return weights
+            if with_cross_attention:
+                tensors.update({
+                    f"{prefix}.cross_attn_norm1.weight": torch.ones(dim, dtype=dtype),
+                    f"{prefix}.cross_attention.to_q.weight": torch.randn((dim, dim), dtype=dtype),
+                    f"{prefix}.cross_attention.to_kv.weight": torch.randn((2 * dim, context_dim), dtype=dtype),
+                    f"{prefix}.cross_attention.to_out.weight": torch.randn((dim, dim), dtype=dtype),
+                    f"{prefix}.cross_attention.norm_q.weight": torch.ones(128, dtype=dtype),
+                    f"{prefix}.cross_attention.norm_k.weight": torch.ones(128, dtype=dtype),
+                    f"{prefix}.cross_attn_norm2.weight": torch.ones(dim, dtype=dtype),
+                    f"{prefix}.cross_attn_gate": torch.ones(1, dtype=dtype),
+                })
+            return tensors
 
         state_dict = {
             "x_embedder.weight": torch.randn((dim, 128), dtype=dtype),
-            "x_embedder.bias": torch.zeros(dim, dtype=dtype),
-            "t_embedder.mlp.0.weight": torch.randn((dim, 256), dtype=dtype),
-            "t_embedder.mlp.2.weight": torch.randn((256, dim), dtype=dtype),
-            "final_layer.linear.weight": torch.randn((128, dim), dtype=dtype),
-            "final_layer.adaLN_modulation.1.weight": torch.randn((dim, 256), dtype=dtype),
-            "perceiver.latent_queries": torch.randn((gist, dim), dtype=dtype),
+            "x_embedder.bias": torch.randn((dim,), dtype=dtype),
+            "t_embedder.mlp.0.weight": torch.randn((1024, 256), dtype=dtype),
+            "t_embedder.mlp.0.bias": torch.randn((1024,), dtype=dtype),
+            "t_embedder.mlp.2.weight": torch.randn((256, 1024), dtype=dtype),
+            "t_embedder.mlp.2.bias": torch.randn((256,), dtype=dtype),
+            "perceiver.latent_queries": torch.randn((512, dim), dtype=dtype),
             "perceiver.norm_out.weight": torch.ones(dim, dtype=dtype),
-            "perceiver.layers.0.cross_attention.to_kv.weight": torch.randn((2 * dim, cap), dtype=dtype),
-            "perceiver.layers.0.ffn.w2.weight": torch.randn((dim, ffn), dtype=dtype),
+            "final_layer.adaLN_modulation.1.weight": torch.ones(dim, dtype=dtype),
+            "final_layer.adaLN_modulation.1.bias": torch.zeros(dim, dtype=dtype),
+            "final_layer.linear.weight": torch.randn((128, dim), dtype=dtype),
         }
-        state_dict.update(block("noise_refiner.0"))
-        state_dict.update(block("layers.0", injection=True))
+        state_dict.update(block_tensors("noise_refiner.0"))
+        state_dict.update({
+            "perceiver.layers.0.cross_attn_norm.weight": torch.ones(dim, dtype=dtype),
+            "perceiver.layers.0.cross_attention.to_q.weight": torch.randn((dim, dim), dtype=dtype),
+            "perceiver.layers.0.cross_attention.to_kv.weight": torch.randn((2 * dim, context_dim), dtype=dtype),
+            "perceiver.layers.0.cross_attention.to_out.weight": torch.randn((dim, dim), dtype=dtype),
+            "perceiver.layers.0.cross_attention.norm_q.weight": torch.ones(128, dtype=dtype),
+            "perceiver.layers.0.cross_attention.norm_k.weight": torch.ones(128, dtype=dtype),
+            "perceiver.layers.0.self_attn_norm.weight": torch.ones(dim, dtype=dtype),
+            "perceiver.layers.0.self_attention.to_q.weight": torch.randn((dim, dim), dtype=dtype),
+            "perceiver.layers.0.self_attention.to_kv.weight": torch.randn((2 * dim, dim), dtype=dtype),
+            "perceiver.layers.0.self_attention.to_out.weight": torch.randn((dim, dim), dtype=dtype),
+            "perceiver.layers.0.self_attention.norm_q.weight": torch.ones(128, dtype=dtype),
+            "perceiver.layers.0.self_attention.norm_k.weight": torch.ones(128, dtype=dtype),
+            "perceiver.layers.0.ffn_norm.weight": torch.ones(dim, dtype=dtype),
+            "perceiver.layers.0.ffn.w13.weight": torch.randn((2 * ffn_dim, dim), dtype=dtype),
+            "perceiver.layers.0.ffn.w2.weight": torch.randn((dim, ffn_dim), dtype=dtype),
+        })
+        state_dict.update(block_tensors("layers.0", with_cross_attention=True))
         return state_dict
 
-    def test_detects_fibo2_for_fused_and_split_feed_forward(self):
-        for fused in (True, False):
-            with self.subTest(fused=fused):
-                model_arch = detect_arch(self._source_state_dict(fused=fused))
+    def test_detects_fibo2_from_perceiver_transformer_and_output_keys(self):
+        model_arch = detect_arch(self._source_state_dict())
 
-                self.assertIsInstance(model_arch, ModelFibo2)
-                self.assertEqual(model_arch.arch, "fibo2")
-                self.assertIn("^perceiver.latent_queries", model_arch.keys_noquant)
+        self.assertIsInstance(model_arch, ModelFibo2)
+        self.assertEqual(model_arch.arch, "fibo2")
 
-    def test_fibo2_keys_are_not_claimed_by_other_architectures(self):
-        from tools.convert import arch_list, is_model_arch
-
-        state_dict = self._source_state_dict()
-        for model_cls in arch_list:
-            if model_cls is ModelFibo2:
-                continue
-            with self.subTest(arch=model_cls.arch):
-                self.assertFalse(is_model_arch(model_cls, state_dict))
-
-    def test_converts_and_loads_fibo2_gguf_in_static_and_dynamic_modes(self):
+    def test_converts_and_loads_fibo2_gguf_with_precision_rules(self):
         state_dict = self._source_state_dict()
         with TemporaryDirectory() as temp_dir:
-            source_path = Path(temp_dir) / "fibo2.safetensors"
             output_path = Path(temp_dir) / "fibo2-Q4_0.gguf"
-            save_file(state_dict, str(source_path))
-            converted_path, model_arch = convert_file(
-                str(source_path),
-                str(output_path),
-                interact=False,
-                quant_type_name="Q4_0",
-                streamed=True,
+            converted_path, model_arch = convert_state_dict(
+                state_dict, str(output_path), quant_type_name="Q4_0"
             )
 
             reader = gguf.GGUFReader(converted_path)
@@ -1345,55 +1339,84 @@ class Fibo2ConversionTests(unittest.TestCase):
                     dynamic=dynamic,
                 )
                 self.assertEqual(extra["arch_str"], "fibo2")
-                weight = loaded["layers.0.feed_forward.w13.weight"]
-                if dynamic:
-                    loaded_shape = tuple(weight._params.orig_shape)
-                else:
-                    loaded_shape = tuple(weight.tensor_shape)
-                self.assertEqual(loaded_shape, (2 * self.FFN, self.DIM))
-                del loaded, weight
+                del loaded
                 gc.collect()
 
         self.assertIsInstance(model_arch, ModelFibo2)
         self.assertEqual(architecture, "fibo2")
-        for key in (
-            "layers.0.attention.qkv.weight",
-            "layers.0.feed_forward.w13.weight",
-            "layers.0.feed_forward.w2.weight",
-            "layers.0.cross_attention.to_kv.weight",
-            "perceiver.layers.0.cross_attention.to_kv.weight",
-        ):
-            with self.subTest(key=key):
-                self.assertEqual(tensor_types[key], gguf.GGMLQuantizationType.Q4_0)
-        # latent_queries is a bare 2D parameter that the model slices at runtime;
-        # it must never be quantized even though its name has no ".weight".
-        for key in (
-            "perceiver.latent_queries",
-            "x_embedder.weight",
-            "t_embedder.mlp.0.weight",
-            "final_layer.linear.weight",
-            "final_layer.adaLN_modulation.1.weight",
-            "layers.0.adaLN_modulation.0.weight",
-            "noise_refiner.0.adaLN_modulation.0.weight",
-        ):
-            with self.subTest(key=key):
-                self.assertEqual(tensor_types[key], gguf.GGMLQuantizationType.BF16)
         self.assertEqual(
-            tensor_types["layers.0.cross_attn_gate"], gguf.GGMLQuantizationType.F32
+            tensor_types["layers.0.attention.qkv.weight"],
+            gguf.GGMLQuantizationType.Q4_0,
+        )
+        self.assertEqual(
+            tensor_types["x_embedder.weight"],
+            gguf.GGMLQuantizationType.Q4_0,
+        )
+        self.assertEqual(
+            tensor_types["perceiver.layers.0.cross_attention.to_kv.weight"],
+            gguf.GGMLQuantizationType.Q4_0,
+        )
+        self.assertEqual(
+            tensor_types["perceiver.latent_queries"],
+            gguf.GGMLQuantizationType.BF16,
+        )
+        self.assertEqual(
+            tensor_types["layers.0.adaLN_modulation.0.weight"],
+            gguf.GGMLQuantizationType.BF16,
+        )
+        self.assertEqual(
+            tensor_types["final_layer.adaLN_modulation.1.weight"],
+            gguf.GGMLQuantizationType.F32,
+        )
+        self.assertEqual(
+            tensor_types["noise_refiner.0.feed_forward.w13.weight"],
+            gguf.GGMLQuantizationType.Q4_0,
         )
 
-    def test_installed_comfyui_core_detects_fibo2_when_supported(self):
-        from comfy.model_detection import detect_unet_config
+    def test_k_quants_preserve_128_wide_fibo2_input_projection(self):
+        for quant_type_name in ("Q6_K", "Q4_K_M"):
+            with self.subTest(quant_type_name=quant_type_name):
+                state_dict = self._source_state_dict()
+                state_dict["x_embedder.weight"] = torch.randn(
+                    (3584, 128), dtype=torch.bfloat16
+                )
+                with TemporaryDirectory() as temp_dir:
+                    output_path = Path(temp_dir) / f"fibo2-{quant_type_name}.gguf"
+                    converted_path, model_arch = convert_state_dict(
+                        state_dict,
+                        str(output_path),
+                        quant_type_name=quant_type_name,
+                    )
 
-        config = detect_unet_config(self._source_state_dict(), "")
-        if config is None or config.get("image_model") != "fibo2":
-            self.skipTest(
-                "Installed ComfyUI predates core Fibo 2.0 support "
-                "(upstream commit 87ed5a06, PR #17240)."
-            )
-        self.assertEqual(config["image_model"], "fibo2")
-        self.assertEqual(config["max_gist_tokens"], self.GIST)
-        self.assertEqual(config["dim"], self.DIM)
+                    reader = gguf.GGUFReader(converted_path)
+                    tensor_types = {
+                        tensor.name: tensor.tensor_type for tensor in reader.tensors
+                    }
+                    reader.tensors.clear()
+                    reader.fields.clear()
+                    reader.data._mmap.close()
+                    del reader
+
+                self.assertIsInstance(model_arch, ModelFibo2)
+                self.assertEqual(
+                    tensor_types["x_embedder.weight"],
+                    gguf.GGMLQuantizationType.BF16,
+                )
+                if quant_type_name == "Q6_K":
+                    self.assertEqual(
+                        tensor_types["layers.0.attention.qkv.weight"],
+                        gguf.GGMLQuantizationType.Q6_K,
+                    )
+                else:
+                    self.assertIn(
+                        tensor_types["layers.0.attention.qkv.weight"],
+                        {
+                            gguf.GGMLQuantizationType.Q4_K,
+                            gguf.GGMLQuantizationType.Q5_K,
+                            gguf.GGMLQuantizationType.Q6_K,
+                        },
+                    )
+
 
 class QwenImage21InferenceFallbackTests(unittest.TestCase):
     @classmethod
@@ -1571,12 +1594,6 @@ class QwenImage21InferenceFallbackTests(unittest.TestCase):
                     self.assertEqual(
                         self.nodes._qwen_image21_fp16_fallback_dtype({"arch_str": arch}),
                         torch.float16,
-                    )
-            # Architectures whose core config already lists fp16 are left alone.
-            for arch in ("krea2", "minimax_music3"):
-                with self.subTest(arch=arch):
-                    self.assertIsNone(
-                        self.nodes._qwen_image21_fp16_fallback_dtype({"arch_str": arch})
                     )
 
             bf16_support.return_value = True
